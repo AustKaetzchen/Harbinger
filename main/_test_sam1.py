@@ -30,9 +30,6 @@ def cleanupMemory (sam_model=None, masks=None):
     )
 
 def generateOptimizedMasks (image, sam_model):
-  import torch
-  from segment_anything import SamAutomaticMaskGenerator
-
   # Free up unallocated memory from model loading
   if torch.cuda.is_available():
     torch.cuda.empty_cache()
