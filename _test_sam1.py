@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
-def cleanupMemory(sam_model=None, masks=None):
+def cleanupMemory (sam_model=None, masks=None):
     import gc
     import torch
     import matplotlib.pyplot as plt
@@ -27,7 +27,7 @@ def cleanupMemory(sam_model=None, masks=None):
         torch.cuda.ipc_collect()
         print(f"GPU memory cleared. Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB, Reserved: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
 
-def loadAndPrepareImage(image_path, max_dimension=2048):
+def loadAndPrepareImage (image_path, max_dimension=2048):
     image = cv2.imread(image_path)
     if image is None:
         raise FileNotFoundError(f"Could not read image from {image_path}. Please check the path.")
@@ -45,7 +45,7 @@ def loadAndPrepareImage(image_path, max_dimension=2048):
         
     return image
 
-def generateOptimizedMasks(image, sam_model):
+def generateOptimizedMasks (image, sam_model):
     import torch
     from segment_anything import SamAutomaticMaskGenerator
 
@@ -72,7 +72,7 @@ def generateOptimizedMasks(image, sam_model):
 
     return masks
 
-def plotMasks(image, masks, max_background_ratio=0.7):
+def plotMasks (image, masks, max_background_ratio=0.7):
     if len(masks) == 0:
         print("No masks generated.")
         return
@@ -118,7 +118,7 @@ def plotMasks(image, masks, max_background_ratio=0.7):
     plt.tight_layout()
     plt.show()
 
-def splitMasksByColorCloseness(image, masks, delta_e_threshold=25.0, min_region_size=50):
+def splitMasksByColorCloseness (image, masks, delta_e_threshold=25.0, min_region_size=50):
     # Convert image to CIELAB color space (L*a*b*) where spatial Euclidean distance equals human color perception
     lab_img = cv2.cvtColor(image, cv2.COLOR_RGB2LAB).astype(np.float32)
     
@@ -174,20 +174,23 @@ def splitMasksByColorCloseness(image, masks, delta_e_threshold=25.0, min_region_
             
     return refined_masks
 
-def main():
+def main ():
     import os
-    import urllib.request
+    from torch.hub import download_url_to_file
 
     image_path = 'sample01.jpg'
     sam_checkpoint = "sam_vit_h_4b8939.pth"
     model_type = "vit_h"
+    expected_size = 2564550879
     
-    if not os.path.exists(sam_checkpoint):
-        print(f"SAM checkpoint '{sam_checkpoint}' not found locally.")
+    # Check if file is missing or incompletely downloaded
+    if not os.path.exists(sam_checkpoint) or os.path.getsize(sam_checkpoint) < expected_size:
+        if os.path.exists(sam_checkpoint):
+            os.remove(sam_checkpoint)
         print("Downloading SAM vit_h checkpoint (2.56 GB)... Please wait.")
         checkpoint_url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
-        urllib.request.urlretrieve(checkpoint_url, sam_checkpoint)
-        print("Download finished successfully!")
+        download_url_to_file(checkpoint_url, sam_checkpoint)
+        print("Download completed successfully!")
 
     image = loadAndPrepareImage(image_path, max_dimension=2048)
     
