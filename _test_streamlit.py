@@ -3,7 +3,8 @@ import streamlit as st
 from streamlit.web import cli as stcli
 
 def draw ():
-    st.title("Streamlit with Spyder")
+    st.set_page_config(page_title="SRG268 HARBINGER")
+    st.title("[WIP] - Harbinger")
     user_name = st.text_input("What is your name?", "Developer")
     status_message = f"Hello {user_name}, welcome to your Streamlit dashboard!"
     st.write(status_message)
