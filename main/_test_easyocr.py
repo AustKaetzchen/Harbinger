@@ -2,6 +2,7 @@ import sys
 import cv2
 import easyocr
 import numpy as np
+import random
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 from streamlit.web import cli as stcli
@@ -15,18 +16,24 @@ def draw():
     
     if uploaded_file is not None:
         reader_obj = loadReader()
-        col1, col2 = st.columns(2)
+        
+        # Display 3-column gallery
+        col1, col2, col3 = st.columns(3)
         
         with col1:
-            st.subheader("Original Map")
+            st.subheader("1. Original Map")
             st.image(uploaded_file, use_container_width=True)
             
-        with st.spinner("Segmenting map by straight lines and removing rectangles..."):
-            processed_img, ocr_results = processMap(uploaded_file, reader_obj)
+        with st.spinner("Extracting OCR, then generating geometric box ensemble..."):
+            composite_img, preview_img, ocr_results = processMap(uploaded_file, reader_obj)
             
         with col2:
-            st.subheader("Annotated & Masked Map")
-            st.image(processed_img, use_container_width=True)
+            st.subheader("2. Segmentation Candidates")
+            st.image(preview_img, use_container_width=True)
+            
+        with col3:
+            st.subheader("3. Annotated & Masked Output")
+            st.image(composite_img, use_container_width=True)
             
         st.subheader("Extracted Text Results")
         if ocr_results:
@@ -66,85 +73,127 @@ def maskInfoboxes(img_pil):
     img_h, img_w = img_np.shape[:2]
     total_area = img_h * img_w
     
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGBA2GRAY)
-    mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB)
+    
+    # Pad the image by 10 pixels on all sides so UI elements touching the screen edge form closed contours
+    pad = 10
+    img_pad = cv2.copyMakeBorder(img_rgb, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=[0, 0, 0])
+    
+    contours_pool = []
+    
+    # --- ENSEMBLE GENERATOR 1: Canny Edge Detection ---
+    gray_pad = cv2.cvtColor(img_pad, cv2.COLOR_RGB2GRAY)
+    for t1, t2 in [(30, 100), (50, 150), (100, 200)]:
+        edges = cv2.Canny(gray_pad, t1, t2)
+        closed = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+        cnts, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours_pool.extend(cnts)
 
-    # 1. Edge detection and grab all straight lines
-    edges = cv2.Canny(gray, 30, 150)
-    
-    # Extract purely vertical and horizontal lines (this destroys organic terrain shapes)
-    min_line = 15
-    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (min_line, 1))
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_line))
-    
-    h_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, h_kernel)
-    v_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, v_kernel)
-    
-    # Combine into a single grid of straight lines
-    grid = cv2.bitwise_or(h_lines, v_lines)
-    
-    # Connect intersecting lines to close off box corners
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
-    grid = cv2.dilate(grid, dilate_kernel, iterations=2)
-    
-    # Draw a thin border to seal off UI elements resting exactly on the edge of the image
-    cv2.rectangle(grid, (0, 0), (img_w - 1, img_h - 1), 255, 2)
+    # --- ENSEMBLE GENERATOR 2: Adaptive Thresholding ---
+    # Great for capturing text boxes and heavily outlined UI elements
+    thresh1 = cv2.adaptiveThreshold(gray_pad, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    thresh2 = cv2.adaptiveThreshold(gray_pad, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    for th in [thresh1, thresh2]:
+        cnts, _ = cv2.findContours(th, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours_pool.extend(cnts)
 
-    # 2. Segment the map based on straight lines
-    # Inverting the grid gives us solid white segments representing the empty space inside boxes
-    inverted_grid = cv2.bitwise_not(grid)
-    
-    # Find contours of both the bounding frames AND the solid segments inside
-    contours_frames, _ = cv2.findContours(grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    contours_segments, _ = cv2.findContours(inverted_grid, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    
-    all_contours = list(contours_frames) + list(contours_segments)
+    # --- ENSEMBLE GENERATOR 3: Color Quantization ---
+    # We check multiple bin sizes to catch both stark contrasts and subtle gradients
+    for bin_size in [16, 32]:
+        quantized = (img_pad.astype(np.int32) // bin_size) * bin_size
+        quantized = quantized.astype(np.uint8)
+        pixels = quantized.reshape(-1, 3)
+        colors, counts = np.unique(pixels, axis=0, return_counts=True)
+        
+        # Check the top 20 colors for each bin size (40 total color sweeps)
+        top_colors = colors[np.argsort(-counts)][:20]
+        
+        for color in top_colors:
+            lower = np.clip(color, 0, 255).astype(np.uint8)
+            upper = np.clip(color + bin_size - 1, 0, 255).astype(np.uint8)
+            color_mask = cv2.inRange(quantized, lower, upper)
+            
+            # Morph close to fuse text/flags resting on the color block
+            color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+            
+            cnts, _ = cv2.findContours(color_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            contours_pool.extend(cnts)
 
-    # 3. If those segments are a rectangle, remove them
-    for cnt in all_contours:
+    # --- GEOMETRIC FILTERING ---
+    # Draw all successfully validated boxes as solid white onto a master mask
+    mask_rects_pad = np.zeros(img_pad.shape[:2], dtype=np.uint8)
+    
+    for cnt in contours_pool:
         x, y, w, h = cv2.boundingRect(cnt)
-        area = w * h
+        bbox_area = w * h
         
-        # Filter out tiny pixel noise and ignore the full-screen map segment itself
-        if area < 150 or area > total_area * 0.70:
+        # Discard tiny text/noise (< 0.1%) and massive continents (> 50%)
+        if bbox_area < (total_area * 0.001) or bbox_area > (total_area * 0.50):
             continue
-
-        is_rect = False
-        contour_area = cv2.contourArea(cnt)
+            
+        c_area = cv2.contourArea(cnt)
+        if bbox_area == 0:
+            continue
+            
+        # THE MAGIC RULE: If the shape's outer boundary fills >88% of its bounding box, 
+        # it is mathematically an axis-aligned rectangle (an infobox).
+        solidity = c_area / bbox_area
         
-        # Test A: Extent (For solid blobs like flags or white popups)
-        # If the segment densely fills its bounding box, it's a rectangle.
-        if area > 0 and (contour_area / area) > 0.85:
-            is_rect = True
-        else:
-            # Test B: Polygon Trace (For hollow frames like the main legend border)
-            # Because the segments are sourced entirely from straight horizontal/vertical 
-            # lines, any 4-sided convex polygon found here is mathematically a perfect rectangle.
+        if solidity > 0.88:
+            # Extra safety check: Ensure the contour roughly has corners, ignoring rounded edges
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
             
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                is_rect = True
-                
-        if is_rect:
-            # Mask the entire segment area
-            cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
+            if len(approx) <= 8:
+                cv2.rectangle(mask_rects_pad, (x, y), (x+w, y+h), 255, -1)
 
-    # Apply the mask to make removed regions transparent
-    img_np[mask == 255] = (0, 0, 0, 0)
-    return Image.fromarray(img_np)
+    # Remove the 10-pixel padding to return the mask to the image's original dimensions
+    mask_rects = mask_rects_pad[pad:-pad, pad:-pad]
+
+    # --- MERGE & DRAW PREVIEW ---
+    # Because we drew all the valid boxes overlapping each other as solid white,
+    # finding contours on this master mask automatically fuses them into perfect unified rectangles.
+    final_contours, _ = cv2.findContours(mask_rects, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    preview_img = (img_rgb * 0.35).astype(np.uint8)
+    
+    # Expand the transparency mask slightly to consume the actual UI border lines
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    final_mask = cv2.dilate(mask_rects, dilate_kernel, iterations=1)
+    
+    for cnt in final_contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # Draw on gallery preview
+        rand_color = (random.randint(80, 255), random.randint(80, 255), random.randint(80, 255))
+        overlay = preview_img.copy()
+        cv2.rectangle(overlay, (x, y), (x+w, y+h), rand_color, -1)
+        cv2.addWeighted(overlay, 0.5, preview_img, 0.5, 0, preview_img)
+        cv2.rectangle(preview_img, (x, y), (x+w, y+h), rand_color, 2)
+        
+        text = "Infobox"
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        tx = x + (w - text_size[0]) // 2
+        ty = y + (h + text_size[1]) // 2
+        cv2.rectangle(preview_img, (tx - 2, ty - text_size[1] - 2), (tx + text_size[0] + 2, ty + 2), (0, 0, 0), -1)
+        cv2.putText(preview_img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    # Erase from the final map output
+    img_np[final_mask == 255] = (0, 0, 0, 0)
+    
+    return Image.fromarray(img_np), Image.fromarray(preview_img)
 
 def processMap(image_file, reader_obj):
     img_pil = Image.open(image_file).convert("RGBA")
     
-    # Analyze text on the raw original map
-    img_np = np.array(img_pil.convert("RGB"))
-    ocr_results = reader_obj.readtext(img_np)
+    # 1. RUN OCR FIRST (Strict processing order enforced here)
+    img_np_rgb = np.array(img_pil.convert("RGB"))
+    ocr_results = reader_obj.readtext(img_np_rgb)
     
-    # Erase the rectangles
-    img_pil = maskInfoboxes(img_pil)
+    # 2. Erase the rectangles and generate the gallery preview map
+    img_pil, preview_pil = maskInfoboxes(img_pil)
     
-    # Draw OCR bounding boxes
+    # 3. Draw OCR bounding boxes over the output map
     overlay_img = Image.new("RGBA", img_pil.size, (0, 0, 0, 0))
     draw_obj = ImageDraw.Draw(overlay_img)
     font_obj = loadFont(14)
@@ -164,7 +213,8 @@ def processMap(image_file, reader_obj):
         draw_obj.text(text_pos, label_text, fill=(0, 0, 0, 255), font=font_obj)
         
     composite_img = Image.alpha_composite(img_pil, overlay_img)
-    return composite_img, ocr_results
+    
+    return composite_img, preview_pil, ocr_results
 
 if __name__ == "__main__":
     is_running = st.runtime.exists()
