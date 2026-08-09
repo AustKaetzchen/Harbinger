@@ -30,7 +30,8 @@ def denoiseMap (img_pil):
   
   for label_idx in range(1, num_labels):
     area = stats[label_idx, cv2.CC_STAT_AREA]
-    if area < 30:
+    # Reduced from 30 to 10 to preserve fine resolution in tight straits and small islands
+    if area < 10:
       bin_mask[labels == label_idx] = True
       
   _, indices = distance_transform_edt(bin_mask, return_indices=True)
@@ -41,7 +42,8 @@ def denoiseMap (img_pil):
   else:
     denoised_np = denoised_rgb
     
-  return Image.fromarray(denoised_np)
+  # We return the original boolean mask (not anti-aliased) to act as our unadulterated edge cache.
+  return Image.fromarray(denoised_np), bin_mask
 
 def draw ():
   st.set_page_config(page_title="Map Text Extraction Tool", layout="wide")
@@ -53,36 +55,41 @@ def draw ():
   if uploaded_file is not None:
     reader_obj = loadReader()
     
-    img1, img2 = st.columns(2)
-    img3, img4 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
+    col4, col5, col6 = st.columns(3)
     
-    with img1:
+    with col1:
       st.subheader("1. Original Map")
       st.image(uploaded_file, use_container_width=True)
       
     with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
-      masked_img, composite_img, preview_img, ocr_results = processMap(uploaded_file, reader_obj)
+      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil = processMap(uploaded_file, reader_obj)
       
-    with img2:
+    with col2:
       st.subheader("2. Segmentation Candidates")
       st.image(preview_img, use_container_width=True)
       
-    with img3:
-      st.subheader("3. Annotated & Masked Output")
+    with col3:
+      st.subheader("3. Post-Process Edges")
+      st.image(edge_vis_pil, use_container_width=True)
+      
+    with col4:
+      st.subheader("4. Annotated & Masked Output")
       st.image(composite_img, use_container_width=True)
       
-    with img4:
-      st.subheader("4. Final image")
+    with col5:
+      st.subheader("5. Final image")
       st.image(masked_img, use_container_width=True)
       
-    st.subheader("Extracted Text Results")
-    if ocr_results:
-      results_data = []
-      for bbox, text, prob in ocr_results:
-        results_data.append({"Text": text, "Confidence": f"{prob*100:.2f}%"})
-      st.table(results_data)
-    else:
-      st.info("No text detected in the uploaded map.")
+    with col6:
+      st.subheader("Extracted Text Results")
+      if ocr_results:
+        results_data = []
+        for bbox, text, prob in ocr_results:
+          results_data.append({"Text": text, "Confidence": f"{prob*100:.2f}%"})
+        st.dataframe(results_data, use_container_width=True)
+      else:
+        st.info("No text detected in the uploaded map.")
 
 def initApp ():
   sys.argv = ["streamlit", "run", __file__]
@@ -218,7 +225,7 @@ def maskInfoboxes (img_pil):
   
   return Image.fromarray(img_np), Image.fromarray(preview_img)
 
-def postProcessMap (img_pil, reader_obj):
+def postProcessMap (img_pil, reader_obj, edge_cache):
   img_np = np.array(img_pil)
   has_alpha = img_np.shape[2] == 4
   img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
@@ -234,9 +241,11 @@ def postProcessMap (img_pil, reader_obj):
   if np.any(text_mask):
     _, indices = distance_transform_edt(text_mask, return_indices=True)
     img_rgb = img_rgb[indices[0], indices[1]]
+    edge_cache = edge_cache | text_mask  # Incorporate these into the non-anti-aliased cache logic for pristine borders
     
   # Step 2: Detect thin linear features (rivers) via morphological operations
-  kernel_river = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+  # Reduced kernel from (9, 9) to (5, 5) to prevent destroying slightly thicker features like geographical straits
+  kernel_river = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
   opened_rgb = cv2.morphologyEx(img_rgb, cv2.MORPH_OPEN, kernel_river)
   closed_rgb = cv2.morphologyEx(img_rgb, cv2.MORPH_CLOSE, kernel_river)
   
@@ -247,17 +256,37 @@ def postProcessMap (img_pil, reader_obj):
   if np.any(river_mask):
     _, indices = distance_transform_edt(river_mask, return_indices=True)
     img_rgb = img_rgb[indices[0], indices[1]]
+    edge_cache = edge_cache | river_mask  
     
   # Step 3: Inner-segment grain smoothing via high-spatial mean shift and median filtering
   flat_rgb = cv2.pyrMeanShiftFiltering(img_rgb, 15, 40)
   flat_rgb = cv2.medianBlur(flat_rgb, 7)
+  
+  # Step 4: Reimpose exact boundaries & repair bleeding
+  num_labels, labels = cv2.connectedComponents((~edge_cache).astype(np.uint8), connectivity=8)
+  segmented_rgb = np.zeros_like(flat_rgb)
+  
+  # Flatten interior component colours (Start at 0 to ensure the background component is also processed)
+  for label_idx in range(num_labels):
+    mask = (labels == label_idx)
+    if np.any(mask):
+      avg_color = np.mean(flat_rgb[mask], axis=0).astype(np.uint8)
+      segmented_rgb[mask] = avg_color
+      
+  # Visualisation image for edges overlay on the flat segments
+  edge_vis = segmented_rgb.copy()
+  edge_vis[edge_cache] = [255, 0, 255] # Outline segments explicitly in Magenta for Streamlit UI
+      
+  # Resolve isolated edge boundaries with closest solid neighbour colours
+  _, indices = distance_transform_edt(edge_cache, return_indices=True)
+  flat_rgb = segmented_rgb[indices[0], indices[1]]
   
   if has_alpha:
     out_np = np.dstack((flat_rgb, img_np[:, :, 3]))
   else:
     out_np = flat_rgb
     
-  return Image.fromarray(out_np)
+  return Image.fromarray(out_np), Image.fromarray(edge_vis)
 
 def processMap (image_file, reader_obj):
   img_pil = Image.open(image_file).convert("RGBA")
@@ -270,10 +299,10 @@ def processMap (image_file, reader_obj):
   img_pil, preview_pil = maskInfoboxes(img_pil)
   
   # 3. Denoising thin networks
-  denoised_pil = denoiseMap(img_pil)
+  denoised_pil, edge_cache = denoiseMap(img_pil)
   
   # 4. Post-processing: second OCR text removal, river filtering & inner-segment flattening
-  final_pil = postProcessMap(denoised_pil, reader_obj)
+  final_pil, edge_vis_pil = postProcessMap(denoised_pil, reader_obj, edge_cache)
   
   # 5. Draw OCR bounds
   overlay_img = Image.new("RGBA", final_pil.size, (0, 0, 0, 0))
@@ -297,7 +326,7 @@ def processMap (image_file, reader_obj):
   composite_img = Image.alpha_composite(final_pil, overlay_img)
   masked_img = final_pil
   
-  return masked_img, composite_img, preview_pil, ocr_results
+  return masked_img, composite_img, preview_pil, ocr_results, edge_vis_pil
 
 if __name__ == "__main__":
   is_running = st.runtime.exists()
