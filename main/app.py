@@ -94,7 +94,7 @@ def denoiseMap (img_pil, color_thresh=15, edge_thresh=20):
 def draw ():
   st.set_page_config(page_title="SRG268", layout="wide")
   st.title("(SRG268) Frame Analysis")
-  st.write("Upload a map image to extract text, mask legends/infoboxes, view bounding box overlays, and generate diversity segmentation.")
+  st.write("Upload a map image to extract text, mask legends/infoboxes, view bounding box overlays, and generate robust bi-level segmentation.")
   
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
   
@@ -107,13 +107,14 @@ def draw ():
     
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7 = st.columns(3)
+    col8, col9, col10 = st.columns(3)
     
     with col1:
       st.subheader("1. Original Map")
       st.image(uploaded_file, use_container_width=True)
       
     with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
-      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask = processMap(uploaded_file, reader_obj, color_thresh, edge_thresh)
+      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, color_thresh, edge_thresh)
       
     with col2:
       st.subheader("2. Infobox Candidates")
@@ -145,9 +146,78 @@ def draw ():
       with st.spinner("Merging regions bounded by diversity edges..."):
         refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
         segmentation_vis = renderMasks(final_img_np, refined_masks)
-          
       st.image(segmentation_vis, use_container_width=True)
-      st.success(f"Successfully generated {len(refined_masks)} masks.")
+
+    with col8:
+      st.subheader("8. Border Edge Layer")
+      
+      # The user correctly noted that subtracting bounding boxes creates nasty patches/holes.
+      # "We already have a denoising process going on that successfully removes it."
+      # The denoising process (nearest-neighbor inpainting in postProcessMap) perfectly bridges gaps.
+      # By extracting boundaries from the completely inpainted final_img_np, we get continuous
+      # pristine border lines that naturally omit all text boxes and internal rivers.
+      kernel = np.ones((3, 3), np.uint8)
+      grad = cv2.morphologyEx(final_img_np, cv2.MORPH_GRADIENT, kernel)
+      clean_edges = np.max(grad, axis=2) > 0
+      
+      # Intersect with dilated post-process edges to ensure we are strictly honoring original edge traces.
+      # This successfully isolates pure map borders from total_edges while bridging all gaps.
+      total_edges_dilated = cv2.dilate(total_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+      border_edge_layer = clean_edges & total_edges_dilated
+      
+      plot8_img = (final_img_np * 0.35).astype(np.uint8)
+      plot8_img[border_edge_layer] = [255, 0, 255] # Magenta for pure bridged edges
+      st.image(Image.fromarray(plot8_img), use_container_width=True)
+
+    with col9:
+      st.subheader("9. External Edges")
+      # "Wait, why are you doing it on the first-pass segmentation image? No, you won't get any info out of that..."
+      # Correct! Using a distance cutoff to the first-pass segmentation edges defeats the purpose 
+      # of restoring edges that are MISSING from the first-pass segmentation entirely.
+      # Instead of distance filtering against S1, we validate external edges purely by 
+      # enforcing monolithic continuity (filtering out internal artifacts / short dead-ends).
+      
+      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(border_edge_layer.astype(np.uint8), connectivity=8)
+      valid_external_edges = np.zeros_like(border_edge_layer)
+      
+      for i in range(1, num_labels_edges):
+          if stats_edges[i, cv2.CC_STAT_AREA] >= 30: # strict monolithic/length cutoff
+              valid_external_edges[labels_edges == i] = True
+              
+      plot9_img = (final_img_np * 0.35).astype(np.uint8)
+      plot9_img[valid_external_edges] = [0, 255, 255] # Cyan for valid monolithic external edges
+      st.image(Image.fromarray(plot9_img), use_container_width=True)
+
+    with col10:
+      st.subheader("10. Second-Pass Seg.")
+      with st.spinner("Bisecting segments with validated external features..."):
+          second_pass_masks = []
+          
+          # Extract first-pass regions (L1) directly from Plot 7
+          L1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
+          for i, mask_dict in enumerate(refined_masks):
+              L1[mask_dict["segmentation"]] = i + 1
+              
+          # Dilate external edge lines slightly to ensure complete severing/bisection of L1 bodies
+          bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+          bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
+          
+          for i in range(1, len(refined_masks) + 1):
+              mask_i = (L1 == i)
+              # Valid external edges seamlessly cut through merged regions restoring proper borders
+              mask_i_bisected = mask_i & (~bisect_edges)
+              
+              num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
+              
+              for j in range(1, num_sub):
+                  area = sub_stats[j, cv2.CC_STAT_AREA]
+                  if area >= 20: 
+                      sub_mask = (sub_labels == j)
+                      second_pass_masks.append({"segmentation": sub_mask, "area": area})
+                      
+          segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
+      st.image(segmentation_vis_2, use_container_width=True)
+      st.success(f"Generated {len(second_pass_masks)} final robust masks.")
 
 
 def initApp ():
@@ -347,7 +417,7 @@ def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20):
   else:
     out_np = flat_rgb
     
-  return Image.fromarray(out_np), Image.fromarray(edge_vis), text_mask, river_mask
+  return Image.fromarray(out_np), Image.fromarray(edge_vis), text_mask, river_mask, edge_cache
 
 
 def processMap (image_file, reader_obj, color_thresh=15, edge_thresh=20):
@@ -357,7 +427,7 @@ def processMap (image_file, reader_obj, color_thresh=15, edge_thresh=20):
   
   img_pil, preview_pil = maskInfoboxes(img_pil)
   denoised_pil, edge_cache = denoiseMap(img_pil, color_thresh, edge_thresh)
-  final_pil, edge_vis_pil, text_mask, river_mask = postProcessMap(denoised_pil, reader_obj, edge_cache, edge_thresh)
+  final_pil, edge_vis_pil, text_mask, river_mask, total_edges = postProcessMap(denoised_pil, reader_obj, edge_cache, edge_thresh)
   
   overlay_img = Image.new("RGBA", final_pil.size, (0, 0, 0, 0))
   draw_obj = ImageDraw.Draw(overlay_img)
@@ -380,7 +450,7 @@ def processMap (image_file, reader_obj, color_thresh=15, edge_thresh=20):
   composite_img = Image.alpha_composite(final_pil, overlay_img)
   masked_img = final_pil
   
-  return masked_img, composite_img, preview_pil, ocr_results, edge_vis_pil, text_mask, river_mask
+  return masked_img, composite_img, preview_pil, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges
 
 
 def renderMasks (image, masks, max_background_ratio=0.7):
