@@ -223,7 +223,7 @@ def postProcessMap (img_pil, reader_obj):
   has_alpha = img_np.shape[2] == 4
   img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
   
-  # Step 1: Secondary OCR pass on denoised output to locate remaining text & kNN bin
+  # Step 1: Secondary OCR pass for residual text
   ocr_results_post = reader_obj.readtext(img_rgb)
   text_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
   
@@ -235,14 +235,27 @@ def postProcessMap (img_pil, reader_obj):
     _, indices = distance_transform_edt(text_mask, return_indices=True)
     img_rgb = img_rgb[indices[0], indices[1]]
     
-  # Step 2: In-segment grain smoothing via Bilateral & Median Filtering
-  smooth_rgb = cv2.bilateralFilter(img_rgb, 9, 75, 75)
-  smooth_rgb = cv2.medianBlur(smooth_rgb, 5)
+  # Step 2: Detect thin linear features (rivers) via morphological operations
+  kernel_river = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+  opened_rgb = cv2.morphologyEx(img_rgb, cv2.MORPH_OPEN, kernel_river)
+  closed_rgb = cv2.morphologyEx(img_rgb, cv2.MORPH_CLOSE, kernel_river)
+  
+  diff_open = cv2.absdiff(img_rgb, opened_rgb)
+  diff_close = cv2.absdiff(img_rgb, closed_rgb)
+  river_mask = (np.max(diff_open, axis=2) > 20) | (np.max(diff_close, axis=2) > 20)
+  
+  if np.any(river_mask):
+    _, indices = distance_transform_edt(river_mask, return_indices=True)
+    img_rgb = img_rgb[indices[0], indices[1]]
+    
+  # Step 3: Inner-segment grain smoothing via high-spatial mean shift and median filtering
+  flat_rgb = cv2.pyrMeanShiftFiltering(img_rgb, 15, 40)
+  flat_rgb = cv2.medianBlur(flat_rgb, 7)
   
   if has_alpha:
-    out_np = np.dstack((smooth_rgb, img_np[:, :, 3]))
+    out_np = np.dstack((flat_rgb, img_np[:, :, 3]))
   else:
-    out_np = smooth_rgb
+    out_np = flat_rgb
     
   return Image.fromarray(out_np)
 
@@ -259,7 +272,7 @@ def processMap (image_file, reader_obj):
   # 3. Denoising thin networks
   denoised_pil = denoiseMap(img_pil)
   
-  # 4. Post-processing: second OCR text removal & inner-segment grain removal
+  # 4. Post-processing: second OCR text removal, river filtering & inner-segment flattening
   final_pil = postProcessMap(denoised_pil, reader_obj)
   
   # 5. Draw OCR bounds
