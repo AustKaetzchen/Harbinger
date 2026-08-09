@@ -1,12 +1,17 @@
+import os
 import sys
 import cv2
 import easyocr
 import numpy as np
 import random
+import torch
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
 import streamlit as st
 from streamlit.web import cli as stcli
+from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from torch.hub import download_url_to_file
+
 
 def denoiseMap (img_pil, color_thresh=15, edge_thresh=20):
   img_np = np.array(img_pil)
@@ -49,10 +54,11 @@ def denoiseMap (img_pil, color_thresh=15, edge_thresh=20):
     
   return Image.fromarray(denoised_np), bin_mask
 
+
 def draw ():
-  st.set_page_config(page_title="Map Text Extraction Tool", layout="wide")
-  st.title("Map Text Extraction Visualisation")
-  st.write("Upload a map image to extract text, mask legends/infoboxes, and view semi-transparent bounding box overlays.")
+  st.set_page_config(page_title="SRG268", layout="wide")
+  st.title("(SRG268) Frame Analysis")
+  st.write("Upload a map image to extract text, mask legends/infoboxes, view bounding box overlays, and generate SAM masks.")
   
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
   
@@ -74,7 +80,7 @@ def draw ():
       masked_img, composite_img, preview_img, ocr_results, edge_vis_pil = processMap(uploaded_file, reader_obj, color_thresh, edge_thresh)
       
     with col2:
-      st.subheader("2. Segmentation Candidates")
+      st.subheader("2. Infobox Candidates")
       st.image(preview_img, use_container_width=True)
       
     with col3:
@@ -82,26 +88,76 @@ def draw ():
       st.image(edge_vis_pil, use_container_width=True)
       
     with col4:
-      st.subheader("4. Annotated & Masked Output")
+      st.subheader("4. OCR Labelling")
       st.image(composite_img, use_container_width=True)
       
     with col5:
-      st.subheader("5. Final image")
+      st.subheader("5. Denoised Image")
       st.image(masked_img, use_container_width=True)
       
     with col6:
-      st.subheader("Extracted Text Results")
-      if ocr_results:
-        results_data = []
-        for bbox, text, prob in ocr_results:
-          results_data.append({"Text": text, "Confidence": f"{prob*100:.2f}%"})
-        st.dataframe(results_data, use_container_width=True)
-      else:
-        st.info("No text detected in the uploaded map.")
+      st.subheader("6. Segmentation")
+      with st.spinner("Loading SAM model..."):
+        sam_model = loadSamModel()
+        
+        # Take the final processed PIL image from Step 5 and prep for segmentation
+        final_img_np = np.array(masked_img.convert("RGB"))
+        
+        # Keep SAM memory under control for large images uploaded in Streamlit
+        h, w = final_img_np.shape[:2]
+        max_dimension = 2048
+        if max(h, w) > max_dimension:
+          scale = max_dimension / max(h, w)
+          new_h, new_w = int(h * scale), int(w * scale)
+          final_img_np = cv2.resize(final_img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+      with st.spinner("Generating SAM dense masks..."):
+        raw_masks = generateOptimisedMasks(final_img_np, sam_model)
+        
+      with st.spinner("Refining masks using map edge detection and LAB colour separation..."):
+        refined_masks = refineMasksWithEdgesAndColour(raw_masks, final_img_np)
+        segmentation_vis = renderMasks(final_img_np, refined_masks)
+          
+      st.image(segmentation_vis, use_container_width=True)
+      st.success(f"Successfully generated {len(refined_masks)} masks.")
+        
+      # Release memory after processing the upload
+      del raw_masks
+      if torch.cuda.is_available():
+          torch.cuda.empty_cache()
+
+
+def generateOptimisedMasks (image, sam_model):
+  # Free up unallocated memory from model loading
+  if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+  mask_generator = SamAutomaticMaskGenerator(
+    model=sam_model,
+    points_per_side=48,  # Dense point grid balanced for 16GB VRAM
+    points_per_batch=16,  # Reduced batch size to prevent PyTorch tensor allocation spike
+    pred_iou_thresh=0.82,
+    stability_score_thresh=0.88,
+    crop_n_layers=1,
+    crop_n_points_downscale_factor=2,
+    crop_overlap_ratio=512/1500,
+    crop_nms_thresh=0.7,
+  )
+
+  # Updated autocast syntax to eliminate deprecation warning
+  if torch.cuda.is_available():
+    with torch.amp.autocast("cuda"):
+      masks = mask_generator.generate(image)
+  else:
+    masks = mask_generator.generate(image)
+
+  return masks
+
 
 def initApp ():
   sys.argv = ["streamlit", "run", __file__]
   sys.exit(stcli.main())
+
 
 def loadFont (font_size=14):
   font_paths = [
@@ -119,9 +175,38 @@ def loadFont (font_size=14):
       continue
   return ImageFont.load_default()
 
+
 @st.cache_resource
 def loadReader ():
   return easyocr.Reader(["en", "ru"])
+
+
+@st.cache_resource
+def loadSamModel ():
+  sam_checkpoint = "sam_vit_h_4b8939.pth"
+  model_type = "vit_h"
+  expected_size = 2564550879
+
+  # Check if file is missing or incompletely downloaded
+  if (
+    not os.path.exists(sam_checkpoint)
+    or os.path.getsize(sam_checkpoint) < expected_size
+  ):
+    if os.path.exists(sam_checkpoint):
+      os.remove(sam_checkpoint)
+    st.info("Downloading SAM vit_h checkpoint (2.56 GB)... Please wait.")
+    checkpoint_url = (
+      "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth"
+    )
+    download_url_to_file(checkpoint_url, sam_checkpoint)
+    st.success("Download completed successfully!")
+
+  sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+  device = "cuda" if torch.cuda.is_available() else "cpu"
+  sam.to(device=device)
+  
+  return sam
+
 
 def maskInfoboxes (img_pil):
   img_np = np.array(img_pil)
@@ -233,6 +318,7 @@ def maskInfoboxes (img_pil):
   
   return Image.fromarray(img_np), Image.fromarray(preview_img)
 
+
 def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20):
   img_np = np.array(img_pil)
   has_alpha = img_np.shape[2] == 4
@@ -297,6 +383,7 @@ def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20):
     
   return Image.fromarray(out_np), Image.fromarray(edge_vis)
 
+
 def processMap (image_file, reader_obj, color_thresh=15, edge_thresh=20):
   img_pil = Image.open(image_file).convert("RGBA")
   
@@ -336,6 +423,112 @@ def processMap (image_file, reader_obj, color_thresh=15, edge_thresh=20):
   masked_img = final_pil
   
   return masked_img, composite_img, preview_pil, ocr_results, edge_vis_pil
+
+
+def refineMasksWithEdgesAndColour (
+  masks,
+  image,
+  low_threshold=50,
+  high_threshold=150,
+  colour_diff_threshold=25.0,
+):
+  # Convert image to greyscale for edge detection and CIELAB for perceptual colour separation
+  grey = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+  lab_image = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+
+  blurred = cv2.GaussianBlur(grey, (3, 3), 0)
+  edges = cv2.Canny(blurred, low_threshold, high_threshold)
+
+  kernel = np.ones((2, 2), np.uint8)
+  dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+
+  refined_masks = []
+
+  for ann in masks:
+    mask = ann["segmentation"].copy()
+
+    # 1. Zero out pixels overlapping with map border outlines
+    mask[dilated_edges > 0] = False
+
+    if np.sum(mask) < 20:
+      continue
+
+    # 2. Extract LAB colour values of all pixels inside the current mask
+    mask_pixels = lab_image[mask].astype(np.float32)
+    colour_std = np.std(mask_pixels, axis=0)
+
+    # Check if colour variance inside mask is high (indicates merged distinct colours like red and blue)
+    candidate_masks = []
+    if np.linalg.norm(colour_std) > 15.0:
+      # Run 2-cluster K-Means inside the mask
+      criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+      compactness, kmeans_labels, centres = cv2.kmeans(
+        mask_pixels, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS
+      )
+
+      # Calculate Delta E colour distance between the two cluster centres
+      colour_dist = np.linalg.norm(centres[0] - centres[1])
+
+      if colour_dist >= colour_diff_threshold:
+        # Colour difference is high: split mask into two colour sub-masks
+        indices = np.where(mask)
+        for k in range(2):
+          sub_bin_mask = np.zeros_like(mask, dtype=bool)
+          sub_bin_mask[(
+            indices[0][kmeans_labels.ravel() == k],
+            indices[1][kmeans_labels.ravel() == k],
+          )] = True
+          candidate_masks.append(sub_bin_mask)
+      else:
+        candidate_masks.append(mask)
+    else:
+      candidate_masks.append(mask)
+
+    # 3. Separate spatial components for each colour-pure mask candidate
+    for cand_mask in candidate_masks:
+      num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        cand_mask.astype(np.uint8)
+      )
+      for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area < 15:
+          continue
+
+        sub_mask = labels == i
+        new_ann = ann.copy()
+        new_ann["segmentation"] = sub_mask
+        new_ann["area"] = int(area)
+        refined_masks.append(new_ann)
+
+  return refined_masks
+
+
+def renderMasks (image, masks, max_background_ratio=0.7):
+  if len(masks) == 0:
+    return np.zeros_like(image)
+
+  h, w = image.shape[:2]
+  total_pixels = h * w
+
+  # Filter out giant background canvas masks (>70% image area) that cause double-background fill
+  filtered_anns = [
+    ann for ann in masks if (ann["area"] / total_pixels) < max_background_ratio
+  ]
+  if len(filtered_anns) == 0:
+    filtered_anns = masks
+
+  # Sort remaining region masks from largest to smallest
+  sorted_anns = sorted(filtered_anns, key=(lambda x: x["area"]), reverse=True)
+
+  # Pure masks rendered cleanly on dark background
+  mask_img = np.zeros((h, w, 3), dtype=np.uint8)
+  for ann in sorted_anns:
+    m = ann["segmentation"]
+    colour_mask = np.random.randint(0, 256, (3,), dtype=np.uint8)
+    mask_img[m] = colour_mask
+
+  return mask_img
+
 
 if __name__ == "__main__":
   is_running = st.runtime.exists()
