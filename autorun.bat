@@ -1,2 +1,3 @@
-title "Locate Anything (Gradio)"
+@echo off
+title Locate Anything (Gradio)
 python locateanything/app.py
