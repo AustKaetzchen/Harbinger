@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import traceback
 from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 from streamlit.web import cli as stcli
@@ -29,8 +30,8 @@ def buildOverlay (image_input, detection_results, current_mode):
   return annotated_img
 
 def draw ():
-  st.set_page_config(page_title="SRG268 HARBINGER - LocateAnything Playground", layout="wide")
-  st.title("LocateAnything Playground")
+  st.set_page_config(page_title="SRG268 HARBINGER - NVIDIA LocateAnything Playground", layout="wide")
+  st.title("[WIP] - NVIDIA LocateAnything Playground")
   st.sidebar.header("Configuration Panel")
   uploaded_file = st.sidebar.file_uploader("Upload Image via File Dialogue", type=["jpg", "jpeg", "png"])
   if uploaded_file is not None:
@@ -112,9 +113,16 @@ def initApp ():
 @st.cache_resource
 def loadLocateAnythingModel ():
   import torch
-  from transformers import AutoModel, AutoTokenizer, AutoProcessor
+  from transformers import AutoConfig, AutoModel, AutoTokenizer, AutoProcessor
+  patchTransformersDynamicModules()
   try:
     model_path = ensureLocalModelDownloaded(MODEL_ID, LOCAL_MODEL_DIR)
+    config = AutoConfig.from_pretrained(
+      model_path,
+      trust_remote_code=True,
+      local_files_only=True
+    )
+    sanitiseConfig(config)
     tokenizer = AutoTokenizer.from_pretrained(
       model_path,
       trust_remote_code=True,
@@ -126,8 +134,12 @@ def loadLocateAnythingModel ():
       trust_remote_code=True,
       local_files_only=True
     )
+    if hasattr(processor, "image_processor"):
+      setattr(processor.image_processor, "max_pixels", 1024*1024)
+      setattr(processor.image_processor, "min_pixels", 256*28*28)
     model = AutoModel.from_pretrained(
       model_path,
+      config=config,
       dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
       device_map="auto" if torch.cuda.is_available() else "cpu",
       trust_remote_code=True,
@@ -135,7 +147,8 @@ def loadLocateAnythingModel ():
     ).eval()
     return {"processor": processor, "tokenizer": tokenizer, "model": model, "status": "loaded"}
   except Exception as e:
-    return {"processor": None, "tokenizer": None, "model": None, "status": f"unloaded: {str(e)}"}
+    err_tb = traceback.format_exc()
+    return {"processor": None, "tokenizer": None, "model": None, "status": f"unloaded: {str(e)}\nTraceback:\n{err_tb}"}
 
 def parseLocateAnythingOutput (decoded_text, img_w, img_h, default_label):
   boxes = []
@@ -158,6 +171,145 @@ def parseLocateAnythingOutput (decoded_text, img_w, img_h, default_label):
   token_matches = re.findall(r"(<ref>.*?</ref>|<box>.*?</box>|<.*?>|[^<\s]+)", decoded_text)
   tokens = [t.strip() for t in token_matches if t.strip()]
   return boxes, tokens
+
+def patchSingleClass (target_cls):
+  import inspect
+  if not target_cls or not isinstance(target_cls, type):
+    return
+  if hasattr(target_cls, "_tied_weights_keys") and isinstance(target_cls._tied_weights_keys, list):
+    twk = target_cls._tied_weights_keys
+    if len(twk) == 2:
+      target_cls._tied_weights_keys = {twk[0]: twk[1]}
+    elif len(twk) == 1:
+      target_cls._tied_weights_keys = {twk[0]: twk[0]}
+    else:
+      target_cls._tied_weights_keys = {k: k for k in twk}
+  for base in target_cls.__mro__:
+    if "_check_and_adjust_attn_implementation" in base.__dict__:
+      attr = base.__dict__["_check_and_adjust_attn_implementation"]
+      if getattr(attr, "_is_already_patched_for_kernels", False):
+        continue
+      is_class_method = isinstance(attr, classmethod)
+      is_static_method = isinstance(attr, staticmethod)
+      underlying = attr.__func__ if (is_class_method or is_static_method) else attr
+      try:
+        sig = inspect.signature(underlying)
+        has_var_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if "allow_all_kernels" not in sig.parameters and not has_var_kwargs:
+          def makeWrapper (fn):
+            def wrapper (*w_args, **w_kwargs):
+              w_kwargs.pop("allow_all_kernels", None)
+              return fn(*w_args, **w_kwargs)
+            wrapper._is_already_patched_for_kernels = True
+            return wrapper
+          wrapped = makeWrapper(underlying)
+          if is_class_method:
+            new_attr = classmethod(wrapped)
+          elif is_static_method:
+            new_attr = staticmethod(wrapped)
+          else:
+            new_attr = wrapped
+          setattr(new_attr, "_is_already_patched_for_kernels", True)
+          setattr(base, "_check_and_adjust_attn_implementation", new_attr)
+      except Exception:
+        pass
+
+def patchTransformersDynamicModules ():
+  import sys
+  import transformers.dynamic_module_utils
+  import transformers.modeling_utils
+  from transformers import PretrainedConfig, PreTrainedModel
+  orig_config_getattr = getattr(PretrainedConfig, "__getattr__", None)
+  def patchedConfigGetattr (self, key):
+    if key == "rope_theta":
+      return 10000.0
+    if key == "rope_scaling":
+      return {"type": "mrope", "mrope_section": [16, 24, 24]}
+    if orig_config_getattr is not None:
+      return orig_config_getattr(self, key)
+    raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
+  PretrainedConfig.__getattr__ = patchedConfigGetattr
+  @property
+  def ropeScalingProp (self):
+    val = self.__dict__.get("rope_scaling", None)
+    if isinstance(val, list):
+      d_val = {"type": "mrope", "mrope_section": val}
+      self.__dict__["rope_scaling"] = d_val
+      return d_val
+    if isinstance(val, dict):
+      if "type" not in val:
+        val["type"] = "mrope"
+      return val
+    return {"type": "mrope", "mrope_section": [16, 24, 24]}
+  PretrainedConfig.rope_scaling = ropeScalingProp
+  @property
+  def allTiedWeightsKeysProp (self):
+    if "_all_tied_weights_keys" in self.__dict__:
+      return self.__dict__["_all_tied_weights_keys"]
+    try:
+      val = self.get_expanded_tied_weights_keys(all_submodels=False)
+      self.__dict__["_all_tied_weights_keys"] = val
+      return val
+    except Exception:
+      return []
+  @allTiedWeightsKeysProp.setter
+  def allTiedWeightsKeysProp (self, val):
+    self.__dict__["_all_tied_weights_keys"] = val
+  PreTrainedModel.all_tied_weights_keys = allTiedWeightsKeysProp
+  orig_get_expanded = getattr(PreTrainedModel, "get_expanded_tied_weights_keys", None)
+  if orig_get_expanded is not None and not getattr(orig_get_expanded, "_is_patched", False):
+    def patchedGetExpanded (self, *args, **kwargs):
+      if hasattr(self, "_tied_weights_keys"):
+        twk = getattr(self, "_tied_weights_keys")
+        if isinstance(twk, list):
+          if len(twk) == 2:
+            d_twk = {twk[0]: twk[1]}
+          else:
+            d_twk = {k: k for k in twk}
+          try:
+            setattr(self, "_tied_weights_keys", d_twk)
+          except Exception:
+            pass
+      if orig_get_expanded is not None:
+        try:
+          return orig_get_expanded(self, *args, **kwargs)
+        except Exception:
+          return []
+      return []
+    setattr(patchedGetExpanded, "_is_patched", True)
+    PreTrainedModel.get_expanded_tied_weights_keys = patchedGetExpanded
+  patchSingleClass(PreTrainedModel)
+  for mod in list(sys.modules.values()):
+    if mod is not None and hasattr(mod, "__dict__"):
+      for obj in list(mod.__dict__.values()):
+        if isinstance(obj, type) and issubclass(obj, PreTrainedModel):
+          patchSingleClass(obj)
+  orig_init_subclass = getattr(PreTrainedModel, "__init_subclass__", None)
+  @classmethod
+  def patchedInitSubclass (cls, **kwargs):
+    if orig_init_subclass is not None:
+      orig_init_subclass(**kwargs)
+    patchSingleClass(cls)
+  PreTrainedModel.__init_subclass__ = patchedInitSubclass
+  orig_get_module = getattr(transformers.dynamic_module_utils, "get_module_from_dynamic_module", None)
+  if orig_get_module is not None and not getattr(orig_get_module, "_is_patched", False):
+    def patchedGetModule (*args, **kwargs):
+      mod = orig_get_module(*args, **kwargs)
+      if mod is not None and hasattr(mod, "__dict__"):
+        for obj in list(mod.__dict__.values()):
+          if isinstance(obj, type):
+            patchSingleClass(obj)
+      return mod
+    setattr(patchedGetModule, "_is_patched", True)
+    transformers.dynamic_module_utils.get_module_from_dynamic_module = patchedGetModule
+  orig_get_class = getattr(transformers.dynamic_module_utils, "get_class_from_dynamic_module", None)
+  if orig_get_class is not None and not getattr(orig_get_class, "_is_patched", False):
+    def patchedGetClass (*args, **kwargs):
+      cls = orig_get_class(*args, **kwargs)
+      patchSingleClass(cls)
+      return cls
+    setattr(patchedGetClass, "_is_patched", True)
+    transformers.dynamic_module_utils.get_class_from_dynamic_module = patchedGetClass
 
 def runLocateAnythingInference (model_obj, image_input, text_query, current_mode, crop_bounds):
   import torch
@@ -191,30 +343,52 @@ def runLocateAnythingInference (model_obj, image_input, text_query, current_mode
         {"type": "text", "text": prompt}
       ]}
     ]
-    try:
-      text_prompt = processor.py_apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-      images, videos = processor.process_vision_info(messages)
-      inputs = processor(text=[text_prompt], images=images, videos=videos, return_tensors="pt").to(device)
-      pixel_values = inputs["pixel_values"].to(dtype)
-      input_ids = inputs["input_ids"]
-      image_grid_hws = inputs.get("image_grid_hws", None)
-      outputs = model.generate(
-        pixel_values=pixel_values,
-        input_ids=input_ids,
-        attention_mask=inputs.get("attention_mask", None),
-        image_grid_hws=image_grid_hws,
-        tokenizer=tokenizer,
-        max_new_tokens=2048,
-        use_cache=True,
-        generation_mode="hybrid"
-      )
-      res_val = outputs[0] if isinstance(outputs, tuple) else outputs
-      decoded_text = res_val if isinstance(res_val, str) else processor.decode(res_val[0], skip_special_tokens=False)
-    except Exception:
-      inputs = processor(images=image_input, text=prompt, return_tensors="pt").to(device)
-      with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=2048)
-      decoded_text = processor.decode(outputs[0], skip_special_tokens=False)
+    with torch.inference_mode():
+      try:
+        text_prompt = ""
+        if hasattr(processor, "apply_chat_template"):
+          text_prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        elif hasattr(tokenizer, "apply_chat_template"):
+          text_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        if not text_prompt or "<|image_pad|>" not in text_prompt:
+          text_prompt = f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        raw_inputs = processor(text=[text_prompt], images=[image_input], padding=True, return_tensors="pt")
+        inputs = {}
+        for k, v in raw_inputs.items():
+          if v is not None:
+            if isinstance(v, torch.Tensor):
+              if k == "pixel_values" and torch.is_floating_point(v):
+                inputs[k] = v.to(device=device, dtype=dtype)
+              else:
+                inputs[k] = v.to(device=device)
+            else:
+              inputs[k] = v
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        pad_id = getattr(tokenizer, "pad_token_id", eos_id)
+        outputs = model.generate(
+          **inputs,
+          max_new_tokens=512,
+          use_cache=True,
+          eos_token_id=eos_id,
+          pad_token_id=pad_id
+        )
+        res_val = outputs[0] if isinstance(outputs, tuple) else outputs
+        decoded_text = res_val if isinstance(res_val, str) else processor.decode(res_val[0], skip_special_tokens=False)
+      except Exception:
+        text_prompt = f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        raw_inputs = processor(text=[text_prompt], images=[image_input], return_tensors="pt")
+        inputs = {}
+        for k, v in raw_inputs.items():
+          if v is not None:
+            if isinstance(v, torch.Tensor):
+              if k == "pixel_values" and torch.is_floating_point(v):
+                inputs[k] = v.to(device=device, dtype=dtype)
+              else:
+                inputs[k] = v.to(device=device)
+            else:
+              inputs[k] = v
+        outputs = model.generate(**inputs, max_new_tokens=512, use_cache=True)
+        decoded_text = processor.decode(outputs[0], skip_special_tokens=False)
   boxes_data, tokens_data = parseLocateAnythingOutput(decoded_text, img_w, img_h, text_query)
   if current_mode == "Decoding" and crop_bounds is not None and boxes_data:
     nw_x, nw_y, _, _ = crop_bounds
@@ -224,6 +398,24 @@ def runLocateAnythingInference (model_obj, image_input, text_query, current_mode
       b["box"][2] += nw_x
       b["box"][3] += nw_y
   return boxes_data, tokens_data
+
+def sanitiseConfig (cfg):
+  if cfg is None:
+    return
+  if not hasattr(cfg, "rope_theta") or getattr(cfg, "rope_theta", None) is None:
+    setattr(cfg, "rope_theta", 10000.0)
+  r_scale = getattr(cfg, "rope_scaling", None)
+  if isinstance(r_scale, list):
+    setattr(cfg, "rope_scaling", {"type": "mrope", "mrope_section": r_scale})
+  elif isinstance(r_scale, dict) and "type" not in r_scale:
+    r_scale["type"] = "mrope"
+  elif r_scale is None:
+    setattr(cfg, "rope_scaling", {"type": "mrope", "mrope_section": [16, 24, 24]})
+  for key, val in list(getattr(cfg, "__dict__", {}).items()):
+    if isinstance(val, list) and key == "rope_scaling":
+      cfg.__dict__[key] = {"type": "mrope", "mrope_section": val}
+    elif hasattr(val, "__dict__") and val is not cfg:
+      sanitiseConfig(val)
 
 def suppressAutoreload ():
   try:
@@ -237,6 +429,7 @@ def suppressAutoreload ():
 
 if __name__ == "__main__":
   suppressAutoreload()
+  patchTransformersDynamicModules()
   is_running = st.runtime.exists()
   if is_running:
     draw()
