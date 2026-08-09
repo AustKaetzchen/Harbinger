@@ -90,7 +90,6 @@ def maskInfoboxes(img_pil):
         contours_pool.extend(cnts)
 
     # --- ENSEMBLE GENERATOR 2: Adaptive Thresholding ---
-    # Great for capturing text boxes and heavily outlined UI elements
     thresh1 = cv2.adaptiveThreshold(gray_pad, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 2)
     thresh2 = cv2.adaptiveThreshold(gray_pad, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
     for th in [thresh1, thresh2]:
@@ -98,14 +97,12 @@ def maskInfoboxes(img_pil):
         contours_pool.extend(cnts)
 
     # --- ENSEMBLE GENERATOR 3: Color Quantization ---
-    # We check multiple bin sizes to catch both stark contrasts and subtle gradients
     for bin_size in [16, 32]:
         quantized = (img_pad.astype(np.int32) // bin_size) * bin_size
         quantized = quantized.astype(np.uint8)
         pixels = quantized.reshape(-1, 3)
         colors, counts = np.unique(pixels, axis=0, return_counts=True)
         
-        # Check the top 20 colors for each bin size (40 total color sweeps)
         top_colors = colors[np.argsort(-counts)][:20]
         
         for color in top_colors:
@@ -113,14 +110,12 @@ def maskInfoboxes(img_pil):
             upper = np.clip(color + bin_size - 1, 0, 255).astype(np.uint8)
             color_mask = cv2.inRange(quantized, lower, upper)
             
-            # Morph close to fuse text/flags resting on the color block
             color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
             
             cnts, _ = cv2.findContours(color_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
             contours_pool.extend(cnts)
 
     # --- GEOMETRIC FILTERING ---
-    # Draw all successfully validated boxes as solid white onto a master mask
     mask_rects_pad = np.zeros(img_pad.shape[:2], dtype=np.uint8)
     
     for cnt in contours_pool:
@@ -140,7 +135,6 @@ def maskInfoboxes(img_pil):
         solidity = c_area / bbox_area
         
         if solidity > 0.88:
-            # Extra safety check: Ensure the contour roughly has corners, ignoring rounded edges
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
             
@@ -151,8 +145,6 @@ def maskInfoboxes(img_pil):
     mask_rects = mask_rects_pad[pad:-pad, pad:-pad]
 
     # --- MERGE & DRAW PREVIEW ---
-    # Because we drew all the valid boxes overlapping each other as solid white,
-    # finding contours on this master mask automatically fuses them into perfect unified rectangles.
     final_contours, _ = cv2.findContours(mask_rects, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     preview_img = (img_rgb * 0.35).astype(np.uint8)
@@ -162,16 +154,18 @@ def maskInfoboxes(img_pil):
     final_mask = cv2.dilate(mask_rects, dilate_kernel, iterations=1)
     
     for cnt in final_contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-        
-        # Draw on gallery preview
+        # Instead of drawing a bounding box (which balloons over empty space when UI panels touch), 
+        # we trace the exact polygon shape of the merged mask.
         rand_color = (random.randint(80, 255), random.randint(80, 255), random.randint(80, 255))
         overlay = preview_img.copy()
-        cv2.rectangle(overlay, (x, y), (x+w, y+h), rand_color, -1)
-        cv2.addWeighted(overlay, 0.5, preview_img, 0.5, 0, preview_img)
-        cv2.rectangle(preview_img, (x, y), (x+w, y+h), rand_color, 2)
         
-        text = "Infobox"
+        cv2.drawContours(overlay, [cnt], 0, rand_color, -1)
+        cv2.addWeighted(overlay, 0.5, preview_img, 0.5, 0, preview_img)
+        cv2.drawContours(preview_img, [cnt], 0, rand_color, 2)
+        
+        # Draw a text label roughly in the center of the bounding box
+        x, y, w, h = cv2.boundingRect(cnt)
+        text = "Masked UI"
         text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
         tx = x + (w - text_size[0]) // 2
         ty = y + (h + text_size[1]) // 2
