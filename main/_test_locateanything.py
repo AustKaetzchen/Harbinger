@@ -29,8 +29,8 @@ def buildOverlay (image_input, detection_results, current_mode):
   return annotated_img
 
 def draw ():
-  st.set_page_config(page_title="SRG268 HARBINGER - NVIDIA LocateAnything Playground", layout="wide")
-  st.title("[WIP] - NVIDIA LocateAnything Playground")
+  st.set_page_config(page_title="SRG268 HARBINGER - LocateAnything Playground", layout="wide")
+  st.title("LocateAnything Playground")
   st.sidebar.header("Configuration Panel")
   uploaded_file = st.sidebar.file_uploader("Upload Image via File Dialogue", type=["jpg", "jpeg", "png"])
   if uploaded_file is not None:
