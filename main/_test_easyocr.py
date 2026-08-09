@@ -13,20 +13,16 @@ def denoiseMap (img_pil):
   has_alpha = img_np.shape[2] == 4
   img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
   
-  # Smooth antialiased edges using mean shift filtering
   filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, 15)
   
-  # Colour thresholding via quantisation to handle antialiased JPEG edges
   pixels = filtered.reshape(-1, 3)
   quantised_pixels = (pixels//16)*16
   quantised_img = quantised_pixels.reshape(img_rgb.shape)
   
-  # Compute boundary pixel counts using morphological gradient
   kernel = np.ones((3, 3), np.uint8)
   grad = cv2.morphologyEx(quantised_img, cv2.MORPH_GRADIENT, kernel)
   edge_mask = (np.max(grad, axis=2) > 20).astype(np.uint8)
   
-  # Connected components analysis to identify thin networks with high neighbour ratios
   num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(1-edge_mask, connectivity=8)
   
   bin_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
@@ -37,7 +33,6 @@ def denoiseMap (img_pil):
     if area < 30:
       bin_mask[labels == label_idx] = True
       
-  # kNN binning: inherit colour of nearest valid pixel
   _, indices = distance_transform_edt(bin_mask, return_indices=True)
   denoised_rgb = img_rgb[indices[0], indices[1]]
   
@@ -223,6 +218,34 @@ def maskInfoboxes (img_pil):
   
   return Image.fromarray(img_np), Image.fromarray(preview_img)
 
+def postProcessMap (img_pil, reader_obj):
+  img_np = np.array(img_pil)
+  has_alpha = img_np.shape[2] == 4
+  img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
+  
+  # Step 1: Secondary OCR pass on denoised output to locate remaining text & kNN bin
+  ocr_results_post = reader_obj.readtext(img_rgb)
+  text_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
+  
+  for bbox, text, prob in ocr_results_post:
+    box_pts = np.array(bbox, dtype=np.int32)
+    cv2.fillPoly(text_mask, [box_pts], True)
+    
+  if np.any(text_mask):
+    _, indices = distance_transform_edt(text_mask, return_indices=True)
+    img_rgb = img_rgb[indices[0], indices[1]]
+    
+  # Step 2: In-segment grain smoothing via Bilateral & Median Filtering
+  smooth_rgb = cv2.bilateralFilter(img_rgb, 9, 75, 75)
+  smooth_rgb = cv2.medianBlur(smooth_rgb, 5)
+  
+  if has_alpha:
+    out_np = np.dstack((smooth_rgb, img_np[:, :, 3]))
+  else:
+    out_np = smooth_rgb
+    
+  return Image.fromarray(out_np)
+
 def processMap (image_file, reader_obj):
   img_pil = Image.open(image_file).convert("RGBA")
   
@@ -233,11 +256,14 @@ def processMap (image_file, reader_obj):
   # 2. Masking
   img_pil, preview_pil = maskInfoboxes(img_pil)
   
-  # 3. Denoising thin networks (rivers, borders, text labels)
+  # 3. Denoising thin networks
   denoised_pil = denoiseMap(img_pil)
   
-  # 4. Draw OCR bounds
-  overlay_img = Image.new("RGBA", denoised_pil.size, (0, 0, 0, 0))
+  # 4. Post-processing: second OCR text removal & inner-segment grain removal
+  final_pil = postProcessMap(denoised_pil, reader_obj)
+  
+  # 5. Draw OCR bounds
+  overlay_img = Image.new("RGBA", final_pil.size, (0, 0, 0, 0))
   draw_obj = ImageDraw.Draw(overlay_img)
   font_obj = loadFont(14)
   
@@ -255,8 +281,8 @@ def processMap (image_file, reader_obj):
     draw_obj.rectangle(text_box, fill=(255, 255, 255, 200))
     draw_obj.text(text_pos, label_text, fill=(0, 0, 0, 255), font=font_obj)
     
-  composite_img = Image.alpha_composite(denoised_pil, overlay_img)
-  masked_img = denoised_pil
+  composite_img = Image.alpha_composite(final_pil, overlay_img)
+  masked_img = final_pil
   
   return masked_img, composite_img, preview_pil, ocr_results
 
