@@ -4,13 +4,14 @@ import numpy as np
 import torch
 from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 
+
 def cleanupMemory (sam_model=None, masks=None):
   import gc
   import matplotlib.pyplot as plt
   import torch
 
   # Close all open matplotlib figures to release CPU RAM
-  plt.close('all')
+  plt.close("all")
 
   # Delete large objects if passed
   if masks is not None:
@@ -29,7 +30,11 @@ def cleanupMemory (sam_model=None, masks=None):
       f"GPU memory cleared. Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB, Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB"
     )
 
-def generateOptimizedMasks (image, sam_model):
+
+def generateOptimisedMasks (image, sam_model):
+  import torch
+  from segment_anything import SamAutomaticMaskGenerator
+
   # Free up unallocated memory from model loading
   if torch.cuda.is_available():
     torch.cuda.empty_cache()
@@ -47,10 +52,11 @@ def generateOptimizedMasks (image, sam_model):
   )
 
   # Updated autocast syntax to eliminate deprecation warning
-  with torch.amp.autocast('cuda'):
+  with torch.amp.autocast("cuda"):
     masks = mask_generator.generate(image)
 
   return masks
+
 
 def loadAndPrepareImage (image_path, max_dimension=2048):
   image = cv2.imread(image_path)
@@ -74,11 +80,12 @@ def loadAndPrepareImage (image_path, max_dimension=2048):
 
   return image
 
+
 def main ():
   import os
   from torch.hub import download_url_to_file
 
-  image_path = 'sample01.jpg'
+  image_path = "sample01.jpg"
   sam_checkpoint = "sam_vit_h_4b8939.pth"
   model_type = "vit_h"
   expected_size = 2564550879
@@ -107,20 +114,21 @@ def main ():
 
   try:
     print("Generating SAM dense masks...")
-    raw_masks = generateOptimizedMasks(image, sam)
+    raw_masks = generateOptimisedMasks(image, sam)
 
-    print("Refining masks using map edge detection and LAB color separation...")
-    refined_masks = refineMasksWithEdgesAndColor(raw_masks, image)
+    print("Refining masks using map edge detection and LAB colour separation...")
+    refined_masks = refineMasksWithEdgesAndColour(raw_masks, image)
 
     print(
-      f"Generated {len(refined_masks)} color and edge-aligned masks. Rendering visualization..."
+      f"Generated {len(refined_masks)} colour and edge-aligned masks. Rendering visualisation..."
     )
     plotMasks(image, refined_masks)
   finally:
     print("Cleaning up GPU and CPU memory...")
     cleanupMemory(
-      sam_model=sam, masks=raw_masks if 'raw_masks' in locals() else None
+      sam_model=sam, masks=raw_masks if "raw_masks" in locals() else None
     )
+
 
 def plotMasks (image, masks, max_background_ratio=0.7):
   if len(masks) == 0:
@@ -132,45 +140,52 @@ def plotMasks (image, masks, max_background_ratio=0.7):
 
   # Filter out giant background canvas masks (>70% image area) that cause double-background fill
   filtered_anns = [
-    ann for ann in masks if (ann['area']/total_pixels) < max_background_ratio
+    ann for ann in masks if (ann["area"]/total_pixels) < max_background_ratio
   ]
   if len(filtered_anns) == 0:
     filtered_anns = masks
 
   # Sort remaining region masks from largest to smallest
-  sorted_anns = sorted(filtered_anns, key=(lambda x: x['area']), reverse=True)
+  sorted_anns = sorted(filtered_anns, key=(lambda x: x["area"]), reverse=True)
 
   # Composite clean 4-channel mask buffer
   mask_img = np.zeros((h, w, 4), dtype=np.float32)
   for ann in sorted_anns:
-    m = ann['segmentation']
-    color_mask = np.random.random(3)
-    mask_img[m, 0:3] = color_mask
+    m = ann["segmentation"]
+    colour_mask = np.random.random(3)
+    mask_img[m, 0:3] = colour_mask
     mask_img[m, 3] = 1.0
 
   fig, axes = plt.subplots(1, 2, figsize=(24, 12))
 
   # 1. Image with single transparent mask overlay
   axes[0].imshow(image)
-  axes[0].axis('off')
-  axes[0].set_title('Original Image', fontsize=16)
+  axes[0].axis("off")
+  axes[0].set_title("Original Image", fontsize=16)
 
   # 2. Pure masks rendered cleanly on dark background
   black_bg = np.zeros((h, w, 3), dtype=np.uint8)
   axes[1].imshow(black_bg)
   axes[1].imshow(mask_img)
-  axes[1].axis('off')
-  axes[1].set_title('Masks Only', fontsize=16)
+  axes[1].axis("off")
+  axes[1].set_title("Masks Only", fontsize=16)
 
   plt.tight_layout()
   plt.show()
 
-def refineMasksWithEdgesAndColor (masks, image, low_threshold=50, high_threshold=150, color_diff_threshold=25.0):
-  # Convert image to grayscale for edge detection and CIELAB for perceptual color separation
-  gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+def refineMasksWithEdgesAndColour (
+  masks,
+  image,
+  low_threshold=50,
+  high_threshold=150,
+  colour_diff_threshold=25.0,
+):
+  # Convert image to greyscale for edge detection and CIELAB for perceptual colour separation
+  grey = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
   lab_image = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
 
-  blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+  blurred = cv2.GaussianBlur(grey, (3, 3), 0)
   edges = cv2.Canny(blurred, low_threshold, high_threshold)
 
   kernel = np.ones((2, 2), np.uint8)
@@ -179,7 +194,7 @@ def refineMasksWithEdgesAndColor (masks, image, low_threshold=50, high_threshold
   refined_masks = []
 
   for ann in masks:
-    mask = ann['segmentation'].copy()
+    mask = ann["segmentation"].copy()
 
     # 1. Zero out pixels overlapping with map border outlines
     mask[dilated_edges > 0] = False
@@ -187,40 +202,38 @@ def refineMasksWithEdgesAndColor (masks, image, low_threshold=50, high_threshold
     if np.sum(mask) < 20:
       continue
 
-    # 2. Extract LAB color values of all pixels inside the current mask
+    # 2. Extract LAB colour values of all pixels inside the current mask
     mask_pixels = lab_image[mask].astype(np.float32)
-    color_std = np.std(mask_pixels, axis=0)
+    colour_std = np.std(mask_pixels, axis=0)
 
-    # Check if color variance inside mask is high (indicates merged distinct colors like red & blue)
+    # Check if colour variance inside mask is high (indicates merged distinct colours like red and blue)
     candidate_masks = []
-    if np.linalg.norm(color_std) > 15.0:
+    if np.linalg.norm(colour_std) > 15.0:
       # Run 2-cluster K-Means inside the mask
-      criteria = (cv2.TERM_CRITERIA_EPS+cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
-      compactness, kmeans_labels, centers = cv2.kmeans(
+      criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 10, 1.0)
+      compactness, kmeans_labels, centres = cv2.kmeans(
         mask_pixels, 2, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS
       )
 
-      # Calculate Delta E color distance between the two cluster centers
-      color_dist = np.linalg.norm(centers[0]-centers[1])
+      # Calculate Delta E colour distance between the two cluster centres
+      colour_dist = np.linalg.norm(centres[0] - centres[1])
 
-      if color_dist >= color_diff_threshold:
-        # Color difference is high: split mask into two color sub-masks
+      if colour_dist >= colour_diff_threshold:
+        # Colour difference is high: split mask into two colour sub-masks
         indices = np.where(mask)
         for k in range(2):
           sub_bin_mask = np.zeros_like(mask, dtype=bool)
-          sub_bin_mask[
-            (
-              indices[0][kmeans_labels.ravel() == k],
-              indices[1][kmeans_labels.ravel() == k],
-            )
-          ] = True
+          sub_bin_mask[(
+            indices[0][kmeans_labels.ravel() == k],
+            indices[1][kmeans_labels.ravel() == k],
+          )] = True
           candidate_masks.append(sub_bin_mask)
       else:
         candidate_masks.append(mask)
     else:
       candidate_masks.append(mask)
 
-    # 3. Separate spatial components for each color-pure mask candidate
+    # 3. Separate spatial components for each colour-pure mask candidate
     for cand_mask in candidate_masks:
       num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         cand_mask.astype(np.uint8)
@@ -232,11 +245,12 @@ def refineMasksWithEdgesAndColor (masks, image, low_threshold=50, high_threshold
 
         sub_mask = labels == i
         new_ann = ann.copy()
-        new_ann['segmentation'] = sub_mask
-        new_ann['area'] = int(area)
+        new_ann["segmentation"] = sub_mask
+        new_ann["area"] = int(area)
         refined_masks.append(new_ann)
 
   return refined_masks
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
   main()
