@@ -145,6 +145,7 @@ def loadLocateAnythingModel ():
       trust_remote_code=True,
       local_files_only=True
     ).eval()
+    setattr(model, "tokenizer", tokenizer)
     return {"processor": processor, "tokenizer": tokenizer, "model": model, "status": "loaded"}
   except Exception as e:
     err_tb = traceback.format_exc()
@@ -174,6 +175,7 @@ def parseLocateAnythingOutput (decoded_text, img_w, img_h, default_label):
 
 def patchSingleClass (target_cls):
   import inspect
+  import torch
   if not target_cls or not isinstance(target_cls, type):
     return
   if hasattr(target_cls, "_tied_weights_keys") and isinstance(target_cls._tied_weights_keys, list):
@@ -184,6 +186,28 @@ def patchSingleClass (target_cls):
       target_cls._tied_weights_keys = {twk[0]: twk[0]}
     else:
       target_cls._tied_weights_keys = {k: k for k in twk}
+  if hasattr(target_cls, "generate"):
+    orig_cls_gen = getattr(target_cls, "generate")
+    if not getattr(orig_cls_gen, "_is_patched_for_none_pixel_values", False):
+      def makeSafeGen (fn):
+        def safeGen (self, *g_args, **g_kwargs):
+          if "pixel_values" in g_kwargs and g_kwargs["pixel_values"] is None:
+            g_kwargs.pop("pixel_values")
+          if ("tokenizer" not in g_kwargs or g_kwargs["tokenizer"] is None) and hasattr(self, "tokenizer"):
+            g_kwargs["tokenizer"] = getattr(self, "tokenizer", None)
+          try:
+            return fn(self, *g_args, **g_kwargs)
+          except AttributeError as err:
+            if "'NoneType' object has no attribute 'to'" in str(err):
+              dtype = getattr(self, "dtype", torch.bfloat16)
+              device = getattr(self, "device", "cuda")
+              dummy_pixels = torch.zeros((1, 3, 224, 224), dtype=dtype, device=device)
+              g_kwargs["pixel_values"] = dummy_pixels
+              return fn(self, *g_args, **g_kwargs)
+            raise err
+        safeGen._is_patched_for_none_pixel_values = True
+        return safeGen
+      setattr(target_cls, "generate", makeSafeGen(orig_cls_gen))
   for base in target_cls.__mro__:
     if "_check_and_adjust_attn_implementation" in base.__dict__:
       attr = base.__dict__["_check_and_adjust_attn_implementation"]
@@ -220,28 +244,6 @@ def patchTransformersDynamicModules ():
   import transformers.modeling_utils
   from transformers import PretrainedConfig, PreTrainedModel
   orig_config_getattr = getattr(PretrainedConfig, "__getattr__", None)
-  def patchedConfigGetattr (self, key):
-    if key == "rope_theta":
-      return 10000.0
-    if key == "rope_scaling":
-      return {"type": "mrope", "mrope_section": [16, 24, 24]}
-    if orig_config_getattr is not None:
-      return orig_config_getattr(self, key)
-    raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
-  PretrainedConfig.__getattr__ = patchedConfigGetattr
-  @property
-  def ropeScalingProp (self):
-    val = self.__dict__.get("rope_scaling", None)
-    if isinstance(val, list):
-      d_val = {"type": "mrope", "mrope_section": val}
-      self.__dict__["rope_scaling"] = d_val
-      return d_val
-    if isinstance(val, dict):
-      if "type" not in val:
-        val["type"] = "mrope"
-      return val
-    return {"type": "mrope", "mrope_section": [16, 24, 24]}
-  PretrainedConfig.rope_scaling = ropeScalingProp
   @property
   def allTiedWeightsKeysProp (self):
     if "_all_tied_weights_keys" in self.__dict__:
@@ -255,27 +257,65 @@ def patchTransformersDynamicModules ():
   @allTiedWeightsKeysProp.setter
   def allTiedWeightsKeysProp (self, val):
     self.__dict__["_all_tied_weights_keys"] = val
+  def patchedConfigGetattr (self, key):
+    if key == "rope_theta":
+      return 10000.0
+    if key == "rope_scaling":
+      return {"type": "mrope", "mrope_section": [16, 24, 24]}
+    if orig_config_getattr is not None:
+      return orig_config_getattr(self, key)
+    raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
+  def patchedGetClass (*args, **kwargs):
+    cls = orig_get_class(*args, **kwargs)
+    patchSingleClass(cls)
+    return cls
+  def patchedGetExpanded (self, *args, **kwargs):
+    if hasattr(self, "_tied_weights_keys"):
+      twk = getattr(self, "_tied_weights_keys")
+      if isinstance(twk, list):
+        if len(twk) == 2:
+          d_twk = {twk[0]: twk[1]}
+        else:
+          d_twk = {k: k for k in twk}
+        try:
+          setattr(self, "_tied_weights_keys", d_twk)
+        except Exception:
+          pass
+    if orig_get_expanded is not None:
+      try:
+        return orig_get_expanded(self, *args, **kwargs)
+      except Exception:
+        return []
+    return []
+  def patchedGetModule (*args, **kwargs):
+    mod = orig_get_module(*args, **kwargs)
+    if mod is not None and hasattr(mod, "__dict__"):
+      for obj in list(mod.__dict__.values()):
+        if isinstance(obj, type):
+          patchSingleClass(obj)
+    return mod
+  @classmethod
+  def patchedInitSubclass (cls, **kwargs):
+    if orig_init_subclass is not None:
+      orig_init_subclass(**kwargs)
+    patchSingleClass(cls)
+  @property
+  def ropeScalingProp (self):
+    val = self.__dict__.get("rope_scaling", None)
+    if isinstance(val, list):
+      d_val = {"type": "mrope", "mrope_section": val}
+      self.__dict__["rope_scaling"] = d_val
+      return d_val
+    if isinstance(val, dict):
+      if "type" not in val:
+        val["type"] = "mrope"
+      return val
+    return {"type": "mrope", "mrope_section": [16, 24, 24]}
+  PretrainedConfig.__getattr__ = patchedConfigGetattr
+  PretrainedConfig.rope_scaling = ropeScalingProp
   PreTrainedModel.all_tied_weights_keys = allTiedWeightsKeysProp
   orig_get_expanded = getattr(PreTrainedModel, "get_expanded_tied_weights_keys", None)
   if orig_get_expanded is not None and not getattr(orig_get_expanded, "_is_patched", False):
-    def patchedGetExpanded (self, *args, **kwargs):
-      if hasattr(self, "_tied_weights_keys"):
-        twk = getattr(self, "_tied_weights_keys")
-        if isinstance(twk, list):
-          if len(twk) == 2:
-            d_twk = {twk[0]: twk[1]}
-          else:
-            d_twk = {k: k for k in twk}
-          try:
-            setattr(self, "_tied_weights_keys", d_twk)
-          except Exception:
-            pass
-      if orig_get_expanded is not None:
-        try:
-          return orig_get_expanded(self, *args, **kwargs)
-        except Exception:
-          return []
-      return []
     setattr(patchedGetExpanded, "_is_patched", True)
     PreTrainedModel.get_expanded_tied_weights_keys = patchedGetExpanded
   patchSingleClass(PreTrainedModel)
@@ -285,29 +325,13 @@ def patchTransformersDynamicModules ():
         if isinstance(obj, type) and issubclass(obj, PreTrainedModel):
           patchSingleClass(obj)
   orig_init_subclass = getattr(PreTrainedModel, "__init_subclass__", None)
-  @classmethod
-  def patchedInitSubclass (cls, **kwargs):
-    if orig_init_subclass is not None:
-      orig_init_subclass(**kwargs)
-    patchSingleClass(cls)
   PreTrainedModel.__init_subclass__ = patchedInitSubclass
   orig_get_module = getattr(transformers.dynamic_module_utils, "get_module_from_dynamic_module", None)
   if orig_get_module is not None and not getattr(orig_get_module, "_is_patched", False):
-    def patchedGetModule (*args, **kwargs):
-      mod = orig_get_module(*args, **kwargs)
-      if mod is not None and hasattr(mod, "__dict__"):
-        for obj in list(mod.__dict__.values()):
-          if isinstance(obj, type):
-            patchSingleClass(obj)
-      return mod
     setattr(patchedGetModule, "_is_patched", True)
     transformers.dynamic_module_utils.get_module_from_dynamic_module = patchedGetModule
   orig_get_class = getattr(transformers.dynamic_module_utils, "get_class_from_dynamic_module", None)
   if orig_get_class is not None and not getattr(orig_get_class, "_is_patched", False):
-    def patchedGetClass (*args, **kwargs):
-      cls = orig_get_class(*args, **kwargs)
-      patchSingleClass(cls)
-      return cls
     setattr(patchedGetClass, "_is_patched", True)
     transformers.dynamic_module_utils.get_class_from_dynamic_module = patchedGetClass
 
@@ -352,21 +376,20 @@ def runLocateAnythingInference (model_obj, image_input, text_query, current_mode
           text_prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         if not text_prompt or "<|image_pad|>" not in text_prompt:
           text_prompt = f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        raw_inputs = processor(text=[text_prompt], images=[image_input], padding=True, return_tensors="pt")
-        inputs = {}
-        for k, v in raw_inputs.items():
-          if v is not None:
-            if isinstance(v, torch.Tensor):
-              if k == "pixel_values" and torch.is_floating_point(v):
-                inputs[k] = v.to(device=device, dtype=dtype)
-              else:
-                inputs[k] = v.to(device=device)
-            else:
-              inputs[k] = v
+        image_inputs = processor.image_processor(image_input, return_tensors="pt")
+        text_inputs = tokenizer(text_prompt, return_tensors="pt")
+        inputs = {
+          "input_ids": text_inputs["input_ids"].to(device),
+          "attention_mask": text_inputs.get("attention_mask").to(device) if text_inputs.get("attention_mask") is not None else None,
+          "pixel_values": image_inputs["pixel_values"].to(device=device, dtype=dtype)
+        }
+        if "image_grid_hws" in image_inputs and image_inputs["image_grid_hws"] is not None:
+          inputs["image_grid_hws"] = image_inputs["image_grid_hws"].to(device)
         eos_id = getattr(tokenizer, "eos_token_id", None)
         pad_id = getattr(tokenizer, "pad_token_id", eos_id)
         outputs = model.generate(
           **inputs,
+          tokenizer=tokenizer,
           max_new_tokens=512,
           use_cache=True,
           eos_token_id=eos_id,
@@ -376,18 +399,20 @@ def runLocateAnythingInference (model_obj, image_input, text_query, current_mode
         decoded_text = res_val if isinstance(res_val, str) else processor.decode(res_val[0], skip_special_tokens=False)
       except Exception:
         text_prompt = f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        raw_inputs = processor(text=[text_prompt], images=[image_input], return_tensors="pt")
-        inputs = {}
-        for k, v in raw_inputs.items():
-          if v is not None:
-            if isinstance(v, torch.Tensor):
-              if k == "pixel_values" and torch.is_floating_point(v):
-                inputs[k] = v.to(device=device, dtype=dtype)
-              else:
-                inputs[k] = v.to(device=device)
-            else:
-              inputs[k] = v
-        outputs = model.generate(**inputs, max_new_tokens=512, use_cache=True)
+        image_inputs = processor.image_processor(image_input, return_tensors="pt")
+        text_inputs = tokenizer(text_prompt, return_tensors="pt")
+        inputs = {
+          "input_ids": text_inputs["input_ids"].to(device),
+          "pixel_values": image_inputs["pixel_values"].to(device=device, dtype=dtype)
+        }
+        if "image_grid_hws" in image_inputs and image_inputs["image_grid_hws"] is not None:
+          inputs["image_grid_hws"] = image_inputs["image_grid_hws"].to(device)
+        outputs = model.generate(
+          **inputs,
+          tokenizer=tokenizer,
+          max_new_tokens=512,
+          use_cache=True
+        )
         decoded_text = processor.decode(outputs[0], skip_special_tokens=False)
   boxes_data, tokens_data = parseLocateAnythingOutput(decoded_text, img_w, img_h, text_query)
   if current_mode == "Decoding" and crop_bounds is not None and boxes_data:
