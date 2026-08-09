@@ -17,23 +17,27 @@ def draw():
     if uploaded_file is not None:
         reader_obj = loadReader()
         
-        # Display 3-column gallery
-        col1, col2, col3 = st.columns(3)
+        img1, img2 = st.columns(2)
+        img3, img4 = st.columns(2)
         
-        with col1:
+        with img1:
             st.subheader("1. Original Map")
             st.image(uploaded_file, use_container_width=True)
             
-        with st.spinner("Extracting OCR, then generating geometric box ensemble..."):
-            composite_img, preview_img, ocr_results = processMap(uploaded_file, reader_obj)
+        with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
+            masked_img, composite_img, preview_img, ocr_results = processMap(uploaded_file, reader_obj)
             
-        with col2:
+        with img2:
             st.subheader("2. Segmentation Candidates")
             st.image(preview_img, use_container_width=True)
             
-        with col3:
+        with img3:
             st.subheader("3. Annotated & Masked Output")
             st.image(composite_img, use_container_width=True)
+        
+        with img4:
+            st.subheader("4. Final image")
+            st.image(masked_img, use_container_width=True)
             
         st.subheader("Extracted Text Results")
         if ocr_results:
@@ -75,13 +79,13 @@ def maskInfoboxes(img_pil):
     
     img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB)
     
-    # Pad the image by 10 pixels on all sides so UI elements touching the screen edge form closed contours
+    # Pad image to close contours touching the edge
     pad = 10
     img_pad = cv2.copyMakeBorder(img_rgb, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=[0, 0, 0])
     
     contours_pool = []
     
-    # --- ENSEMBLE GENERATOR 1: Canny Edge Detection ---
+    # Ensemble 1: Canny edges
     gray_pad = cv2.cvtColor(img_pad, cv2.COLOR_RGB2GRAY)
     for t1, t2 in [(30, 100), (50, 150), (100, 200)]:
         edges = cv2.Canny(gray_pad, t1, t2)
@@ -89,14 +93,14 @@ def maskInfoboxes(img_pil):
         cnts, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         contours_pool.extend(cnts)
 
-    # --- ENSEMBLE GENERATOR 2: Adaptive Thresholding ---
+    # Ensemble 2: Adaptive thresholding
     thresh1 = cv2.adaptiveThreshold(gray_pad, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 11, 2)
     thresh2 = cv2.adaptiveThreshold(gray_pad, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
     for th in [thresh1, thresh2]:
         cnts, _ = cv2.findContours(th, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         contours_pool.extend(cnts)
 
-    # --- ENSEMBLE GENERATOR 3: Color Quantization ---
+    # Ensemble 3: Color quantization
     for bin_size in [16, 32]:
         quantized = (img_pad.astype(np.int32) // bin_size) * bin_size
         quantized = quantized.astype(np.uint8)
@@ -111,18 +115,16 @@ def maskInfoboxes(img_pil):
             color_mask = cv2.inRange(quantized, lower, upper)
             
             color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-            
             cnts, _ = cv2.findContours(color_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
             contours_pool.extend(cnts)
 
-    # --- GEOMETRIC FILTERING ---
+    # Geometric filtering
     mask_rects_pad = np.zeros(img_pad.shape[:2], dtype=np.uint8)
     
     for cnt in contours_pool:
         x, y, w, h = cv2.boundingRect(cnt)
         bbox_area = w * h
         
-        # Discard tiny text/noise (< 0.1%) and massive continents (> 50%)
         if bbox_area < (total_area * 0.001) or bbox_area > (total_area * 0.50):
             continue
             
@@ -130,32 +132,45 @@ def maskInfoboxes(img_pil):
         if bbox_area == 0:
             continue
             
-        # THE MAGIC RULE: If the shape's outer boundary fills >88% of its bounding box, 
-        # it is mathematically an axis-aligned rectangle (an infobox).
         solidity = c_area / bbox_area
         
         if solidity > 0.88:
             peri = cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            
             if len(approx) <= 8:
                 cv2.rectangle(mask_rects_pad, (x, y), (x+w, y+h), 255, -1)
 
-    # Remove the 10-pixel padding to return the mask to the image's original dimensions
     mask_rects = mask_rects_pad[pad:-pad, pad:-pad]
 
-    # --- MERGE & DRAW PREVIEW ---
+    # Post-processing: Enclave resolution
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    mask_closed = cv2.morphologyEx(mask_rects, cv2.MORPH_CLOSE, close_kernel)
+    
+    pad_e = 5
+    mask_closed_pad = cv2.copyMakeBorder(mask_closed, pad_e, pad_e, pad_e, pad_e, cv2.BORDER_CONSTANT, value=255)
+    
+    holes_mask = cv2.bitwise_not(mask_closed_pad)
+    hole_cnts, _ = cv2.findContours(holes_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    mask_rects_resolved_pad = cv2.copyMakeBorder(mask_rects, pad_e, pad_e, pad_e, pad_e, cv2.BORDER_CONSTANT, value=0)
+    
+    for enclave_cnt in hole_cnts:
+        # Resolve small enclaves (<3% area), leaving map insets/large spaces untouched
+        if cv2.contourArea(enclave_cnt) < (total_area * 0.03):
+            hull = cv2.convexHull(enclave_cnt)
+            cv2.drawContours(mask_rects_resolved_pad, [hull], 0, 255, -1)
+                
+    mask_rects = mask_rects_resolved_pad[pad_e:-pad_e, pad_e:-pad_e]
+
+    # Merge and draw preview
     final_contours, _ = cv2.findContours(mask_rects, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     preview_img = (img_rgb * 0.35).astype(np.uint8)
     
-    # Expand the transparency mask slightly to consume the actual UI border lines
     dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     final_mask = cv2.dilate(mask_rects, dilate_kernel, iterations=1)
     
     for cnt in final_contours:
-        # Instead of drawing a bounding box (which balloons over empty space when UI panels touch), 
-        # we trace the exact polygon shape of the merged mask.
         rand_color = (random.randint(80, 255), random.randint(80, 255), random.randint(80, 255))
         overlay = preview_img.copy()
         
@@ -163,7 +178,6 @@ def maskInfoboxes(img_pil):
         cv2.addWeighted(overlay, 0.5, preview_img, 0.5, 0, preview_img)
         cv2.drawContours(preview_img, [cnt], 0, rand_color, 2)
         
-        # Draw a text label roughly in the center of the bounding box
         x, y, w, h = cv2.boundingRect(cnt)
         text = "Masked UI"
         text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
@@ -172,7 +186,6 @@ def maskInfoboxes(img_pil):
         cv2.rectangle(preview_img, (tx - 2, ty - text_size[1] - 2), (tx + text_size[0] + 2, ty + 2), (0, 0, 0), -1)
         cv2.putText(preview_img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # Erase from the final map output
     img_np[final_mask == 255] = (0, 0, 0, 0)
     
     return Image.fromarray(img_np), Image.fromarray(preview_img)
@@ -180,14 +193,14 @@ def maskInfoboxes(img_pil):
 def processMap(image_file, reader_obj):
     img_pil = Image.open(image_file).convert("RGBA")
     
-    # 1. RUN OCR FIRST (Strict processing order enforced here)
+    # 1. OCR (Strictly processed first)
     img_np_rgb = np.array(img_pil.convert("RGB"))
     ocr_results = reader_obj.readtext(img_np_rgb)
     
-    # 2. Erase the rectangles and generate the gallery preview map
+    # 2. Masking
     img_pil, preview_pil = maskInfoboxes(img_pil)
     
-    # 3. Draw OCR bounding boxes over the output map
+    # 3. Draw OCR bounds
     overlay_img = Image.new("RGBA", img_pil.size, (0, 0, 0, 0))
     draw_obj = ImageDraw.Draw(overlay_img)
     font_obj = loadFont(14)
@@ -207,8 +220,9 @@ def processMap(image_file, reader_obj):
         draw_obj.text(text_pos, label_text, fill=(0, 0, 0, 255), font=font_obj)
         
     composite_img = Image.alpha_composite(img_pil, overlay_img)
+    masked_img = img_pil
     
-    return composite_img, preview_pil, ocr_results
+    return masked_img, composite_img, preview_pil, ocr_results
 
 if __name__ == "__main__":
     is_running = st.runtime.exists()

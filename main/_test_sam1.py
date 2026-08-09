@@ -85,7 +85,7 @@ def main ():
   import os
   from torch.hub import download_url_to_file
 
-  image_path = "sample01.jpg"
+  image_path = "sample01_processed.png"
   sam_checkpoint = "sam_vit_h_4b8939.pth"
   model_type = "vit_h"
   expected_size = 2564550879
