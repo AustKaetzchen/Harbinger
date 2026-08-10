@@ -92,7 +92,7 @@ def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
 def draw ():
   st.set_page_config(page_title="SRG268", layout="wide")
   st.title("(SRG268) Frame Analysis")
-  st.write("Upload a map image to extract text, mask legends/infoboxes, view bounding box overlays, and generate robust bi-level segmentation.")
+  st.write("Segments a map and attempts to create a detailed spatial ontology out from the resulting frame, which can then be used for vectorisation and data structuring.")
   
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
   
@@ -104,8 +104,8 @@ def draw ():
     reader_obj = loadReader()
     
     col1, col2, col3, col4 = st.columns(4)
-    col5, col6, col7 = st.columns(3)
-    col8, col9, col10, col11 = st.columns(4)
+    col5, col6, col7, col8 = st.columns(4)
+    col9, col10, col11, col12 = st.columns(4)
     
     with col1:
       st.subheader("1. Original Map")
@@ -115,7 +115,7 @@ def draw ():
       masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh)
       
     with col2:
-      st.subheader("2. Infobox Candidates")
+      st.subheader("2. UI Masking")
       st.image(preview_img, use_container_width=True)
       
     with col3:
@@ -123,15 +123,15 @@ def draw ():
       st.image(masked_img, use_container_width=True)
       
     with col4:
-      st.subheader("4. Post-Process Edges")
+      st.subheader("4. Sharpness Layer")
       st.image(edge_vis_pil, use_container_width=True)
       
     with col5:
-      st.subheader("5. OCR Labelling")
+      st.subheader("5. Semantic Features")
       st.image(composite_img, use_container_width=True)
       
     with col6:
-      st.subheader("6. Diversity Edges")
+      st.subheader("6. Denoised Edges")
       final_img_np = np.array(masked_img.convert("RGB"))
       masked_np = np.array(masked_img)
       alpha_mask = masked_np[:, :, 3] > 0 if masked_np.shape[2] == 4 else np.ones(final_img_np.shape[:2], dtype=bool)
@@ -140,14 +140,14 @@ def draw ():
       st.image(diversity_vis_pil, use_container_width=True)
 
     with col7:
-      st.subheader("7. Bounded Segmentation")
+      st.subheader("7. First-pass Segmentation")
       with st.spinner("Merging regions bounded by diversity edges..."):
         refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
         segmentation_vis = renderMasks(final_img_np, refined_masks)
       st.image(segmentation_vis, use_container_width=True)
 
     with col8:
-      st.subheader("8. Border Edge Layer")
+      st.subheader("8. First-pass Filtering")
       l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
       for i, mask_dict in enumerate(refined_masks):
         l1[mask_dict["segmentation"]] = i+1
@@ -165,7 +165,7 @@ def draw ():
       st.image(Image.fromarray(plot8_img), use_container_width=True)
 
     with col9:
-      st.subheader("9. External Edges")
+      st.subheader("9. Edge Restoration")
       
       real_text_mask = np.zeros(final_img_np.shape[:2], dtype=np.uint8)
       for bbox, text, prob in ocr_results:
@@ -217,7 +217,7 @@ def draw ():
       st.image(Image.fromarray(plot9_img), use_container_width=True)
 
     with col10:
-      st.subheader("10. Second-Pass Seg.")
+      st.subheader("10. Second-pass Segmentation")
       with st.spinner("Bisecting segments with validated external features..."):
         second_pass_masks = []
         
@@ -240,12 +240,19 @@ def draw ():
       st.image(segmentation_vis_2, use_container_width=True)
 
     with col11:
-      st.subheader("11. Repaired Seg. (kNN)")
-      with st.spinner("Binning gap pixels to nearest second-pass neighbour..."):
+      st.subheader("11. First-pass kNN Repair")
+      with st.spinner("Binning bisected gap pixels to nearest second-pass neighbour..."):
         repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbors=5)
         segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
       st.image(segmentation_vis_3, use_container_width=True)
-      st.success(f"Generated {len(repaired_masks)} repaired smooth masks.")
+
+    with col12:
+      st.subheader("12. Second-pass kNN Repair")
+      with st.spinner("Binning all diversity edges to nearest segment..."):
+        final_masks = repairEdgeGaps(final_img_np, repaired_masks, alpha_mask, k_neighbors=5)
+        segmentation_vis_4 = renderMasks(final_img_np, final_masks)
+      st.image(segmentation_vis_4, use_container_width=True)
+      st.success(f"Generated {len(final_masks)} fully repaired masks.")
 
 
 def initApp ():
@@ -502,6 +509,63 @@ def renderMasks (image, masks, max_background_ratio=0.7):
   return mask_img
 
 
+def repairEdgeGaps (img_rgb, masks, alpha_mask=None, k_neighbors=5):
+  if len(masks) == 0:
+    return masks
+
+  h, w = img_rgb.shape[:2]
+  l3_map = np.zeros((h, w), dtype=np.int32)
+  for idx, ann in enumerate(masks):
+    l3_map[ann["segmentation"]] = idx+1
+
+  if alpha_mask is not None:
+    l3_map[~alpha_mask] = 0
+
+  if alpha_mask is not None:
+    unassigned_mask = alpha_mask & (l3_map == 0)
+  else:
+    unassigned_mask = (l3_map == 0)
+
+  assigned_mask = l3_map > 0
+
+  if not np.any(unassigned_mask) or not np.any(assigned_mask):
+    return masks
+
+  lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+  y_coords, x_coords = np.indices((h, w))
+  spatial_scale = 0.2
+  features = np.dstack((lab_img, y_coords*spatial_scale, x_coords*spatial_scale))
+
+  train_features = features[assigned_mask]
+  train_labels = l3_map[assigned_mask]
+  query_features = features[unassigned_mask]
+
+  tree = cKDTree(train_features)
+  _, indices = tree.query(query_features, k=k_neighbors)
+
+  if k_neighbors == 1:
+    repaired_labels = train_labels[indices]
+  else:
+    neighbor_labels = train_labels[indices]
+    mode_res, _ = mode(neighbor_labels, axis=1, keepdims=False)
+    repaired_labels = np.squeeze(mode_res)
+
+  repaired_l3_map = l3_map.copy()
+  repaired_l3_map[unassigned_mask] = repaired_labels
+
+  final_masks = []
+  for idx, ann in enumerate(masks):
+    lbl = idx+1
+    m = (repaired_l3_map == lbl)
+    if alpha_mask is not None:
+      m &= alpha_mask
+    area = int(np.sum(m))
+    if area >= 20:
+      final_masks.append({"segmentation": m, "area": area})
+
+  return final_masks
+
+
 def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask=None, k_neighbors=5):
   if len(second_pass_masks) == 0:
     return second_pass_masks
@@ -520,7 +584,6 @@ def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask
     l1_mask &= alpha_mask
     l2_map[~alpha_mask] = 0
 
-  # Target: Pixels present in 1st pass but cut/omitted in 2nd pass
   unassigned_mask = l1_mask & (l2_map == 0)
   assigned_mask = l2_map > 0
 
