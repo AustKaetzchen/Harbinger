@@ -56,21 +56,21 @@ def buildDiversityEdgeMap (img_rgb, text_mask=None, river_mask=None, alpha_mask=
 
   return edge_uint8, Image.fromarray(diversity_vis)
 
-
+### DENOISE START
 def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
   img_np = np.array(img_pil)
   has_alpha = img_np.shape[2] == 4
   img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
   alpha_channel = img_np[:, :, 3] if has_alpha else np.ones(img_rgb.shape[:2], dtype=np.uint8)*255
 
-  filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, colour_thresh)
+  filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, colour_thresh) # 7 by default
   pixels = filtered.reshape(-1, 3)
 
   quant_step = max(1, colour_thresh)
   quantised_pixels = (pixels//quant_step)*quant_step
   quantised_img = quantised_pixels.reshape(img_rgb.shape)
 
-  kernel = np.ones((3, 3), np.uint8)
+  kernel = np.ones((3, 3), np.uint8) # (3, 3) by default
   grad = cv2.morphologyEx(quantised_img, cv2.MORPH_GRADIENT, kernel)
   edge_mask = (np.max(grad, axis=2) > edge_thresh).astype(np.uint8)
 
@@ -97,7 +97,7 @@ def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
     denoised_np = denoised_rgb
 
   return Image.fromarray(denoised_np), bin_mask
-
+### DENOISE END 
 
 def draw ():
   st.set_page_config(page_title="SRG268", layout="wide")
