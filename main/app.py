@@ -150,42 +150,88 @@ def draw ():
 
     with col8:
       st.subheader("8. Border Edge Layer")
+      # Extract borders (L1) from first-pass Bounded Segmentation 
+      L1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
+      for i, mask_dict in enumerate(refined_masks):
+          L1[mask_dict["segmentation"]] = i + 1
+          
+      h_diff = L1[:, :-1] != L1[:, 1:]
+      v_diff = L1[:-1, :] != L1[1:, :]
+      S1_edges = np.zeros_like(L1, dtype=bool)
       
-      # The user correctly noted that subtracting bounding boxes creates nasty patches/holes.
-      # "We already have a denoising process going on that successfully removes it."
-      # The denoising process (nearest-neighbor inpainting in postProcessMap) perfectly bridges gaps.
-      # By extracting boundaries from the completely inpainted final_img_np, we get continuous
-      # pristine border lines that naturally omit all text boxes and internal rivers.
-      kernel = np.ones((3, 3), np.uint8)
-      grad = cv2.morphologyEx(final_img_np, cv2.MORPH_GRADIENT, kernel)
-      clean_edges = np.max(grad, axis=2) > 0
-      
-      # Intersect with dilated post-process edges to ensure we are strictly honoring original edge traces.
-      # This successfully isolates pure map borders from total_edges while bridging all gaps.
-      total_edges_dilated = cv2.dilate(total_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-      border_edge_layer = clean_edges & total_edges_dilated
+      # FIX: Assign strictly to a single axis dimension block ([:, :-1] instead of both) to completely eliminate 
+      # the "doubling up" / 2-pixel-thick line artifact, strictly enforcing a 1px boundary reference line.
+      S1_edges[:, :-1][h_diff] = True
+      S1_edges[:-1, :][v_diff] = True
       
       plot8_img = (final_img_np * 0.35).astype(np.uint8)
-      plot8_img[border_edge_layer] = [255, 0, 255] # Magenta for pure bridged edges
+      S1_edges_vis = cv2.dilate(S1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+      plot8_img[S1_edges_vis] = [255, 0, 255] # Magenta for pure 1px edge boundaries
       st.image(Image.fromarray(plot8_img), use_container_width=True)
 
     with col9:
       st.subheader("9. External Edges")
-      # "Wait, why are you doing it on the first-pass segmentation image? No, you won't get any info out of that..."
-      # Correct! Using a distance cutoff to the first-pass segmentation edges defeats the purpose 
-      # of restoring edges that are MISSING from the first-pass segmentation entirely.
-      # Instead of distance filtering against S1, we validate external edges purely by 
-      # enforcing monolithic continuity (filtering out internal artifacts / short dead-ends).
       
-      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(border_edge_layer.astype(np.uint8), connectivity=8)
-      valid_external_edges = np.zeros_like(border_edge_layer)
+      # Rebuild true comprehensive OCR mask directly from raw original map findings
+      real_text_mask = np.zeros(final_img_np.shape[:2], dtype=np.uint8)
+      for bbox, text, prob in ocr_results:
+          box_pts = np.array(bbox, dtype=np.int32)
+          cv2.fillPoly(real_text_mask, [box_pts], 255)
+      
+      # Dilate to accommodate antialiasing bleeding entirely
+      real_text_mask = cv2.dilate(real_text_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
+      
+      # FIX: Do NOT subtract river_mask. Subtracting it previously cut chunks out of real borders 
+      # yielding highly discontinuous and jagged results. Instead, we use a fractional envelope filter below.
+      raw_edges = total_edges & (~real_text_mask)
+      
+      if np.any(S1_edges):
+          dist_to_S1 = distance_transform_edt(~S1_edges)
+      else:
+          dist_to_S1 = np.full(S1_edges.shape, 1000.0)
+          
+      # --- GLOBAL COLOUR RANGES IMPLEMENTATION ---
+      # 1. Sample map colors exactly on the edges that strongly align with our first-pass border contours
+      strict_boundary_mask = raw_edges & (dist_to_S1 <= 2)
+      boundary_colors = final_img_np[strict_boundary_mask]
+      
+      if len(boundary_colors) > 0:
+          q_step = 10
+          q_colors = (boundary_colors // q_step) * q_step
+          hashes = q_colors[:,0].astype(np.int64)*65536 + q_colors[:,1].astype(np.int64)*256 + q_colors[:,2].astype(np.int64)
+          unique_hashes, counts = np.unique(hashes, return_counts=True)
+          
+          # 2. Select globally dominant border colours (ignoring small localized artifacts)
+          valid_hashes = unique_hashes[counts > 20] 
+          
+          q_img = (final_img_np // q_step) * q_step
+          img_hashes = q_img[:,:,0].astype(np.int64)*65536 + q_img[:,:,1].astype(np.int64)*256 + q_img[:,:,2].astype(np.int64)
+          valid_color_mask = np.isin(img_hashes, valid_hashes)
+          
+          # 3. Fit these global color gamut ranges back onto the post-process edges
+          color_filtered_edges = raw_edges & valid_color_mask
+      else:
+          color_filtered_edges = raw_edges
+          
+      # --- SPATIAL FILTERING & CONTINUITY PRESERVATION ---
+      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(color_filtered_edges.astype(np.uint8), connectivity=8)
+      valid_external_edges = np.zeros_like(color_filtered_edges)
       
       for i in range(1, num_labels_edges):
-          if stats_edges[i, cv2.CC_STAT_AREA] >= 30: # strict monolithic/length cutoff
-              valid_external_edges[labels_edges == i] = True
+          area = stats_edges[i, cv2.CC_STAT_AREA]
+          if area >= 20: 
+              component_mask = (labels_edges == i)
+              # Verify if a substantial fraction of this monolithic edge mostly hugs the region boundary 
+              # (safely filtering out interior rivers hitting the border perpendicularly without creating jagged holes)
+              close_pixels = np.sum(component_mask & (dist_to_S1 <= 3))
               
+              if (close_pixels / area) > 0.25: 
+                  # Finally, crop out any extreme distant drifts to strictly bound the spatial envelope
+                  final_component = component_mask & (dist_to_S1 <= 15)
+                  valid_external_edges[final_component] = True
+                  
       plot9_img = (final_img_np * 0.35).astype(np.uint8)
-      plot9_img[valid_external_edges] = [0, 255, 255] # Cyan for valid monolithic external edges
+      plot9_img[valid_external_edges] = [0, 255, 255] # Cyan for completely restored continuous edges
       st.image(Image.fromarray(plot9_img), use_container_width=True)
 
     with col10:
@@ -193,18 +239,13 @@ def draw ():
       with st.spinner("Bisecting segments with validated external features..."):
           second_pass_masks = []
           
-          # Extract first-pass regions (L1) directly from Plot 7
-          L1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
-          for i, mask_dict in enumerate(refined_masks):
-              L1[mask_dict["segmentation"]] = i + 1
-              
-          # Dilate external edge lines slightly to ensure complete severing/bisection of L1 bodies
+          # Dilate external edge lines to ensure complete severing/bisection of L1 bodies
           bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
           bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
           
           for i in range(1, len(refined_masks) + 1):
               mask_i = (L1 == i)
-              # Valid external edges seamlessly cut through merged regions restoring proper borders
+              # Second-pass correctly leverages restored external borders to intersect the first-pass mask array
               mask_i_bisected = mask_i & (~bisect_edges)
               
               num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
