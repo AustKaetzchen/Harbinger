@@ -1,5 +1,5 @@
-# SRG268
-Special Research Group 268
+# Harbinger.Segmentation
+Developed by Special Research Group 268 (CRD).
 
 Requirements:
 1. Ensure Anaconda is installed such that you have access to Anaconda Prompt:
