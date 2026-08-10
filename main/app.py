@@ -102,9 +102,9 @@ def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
 
 def drawGui ():
   os.makedirs("output", exist_ok=True)
-  st.set_page_config(page_title="SRG268", layout="wide")
-  st.title("(SRG268) Frame Analysis")
-  st.write("Segments a map and attempts to create a detailed spatial ontology out of the map frame uploaded.")
+  st.set_page_config(page_title="(SRG268-CRD) // Harbinger.Segmentation", page_icon="logo.png", layout="wide")
+  st.title("(SRG268-CRD) // Harbinger Segmentation")
+  st.write("Performs map-optimised segmentation and outputs layer/mutilingual OCR files for use in structuring spatial ontologies. Comes with command line options, see `README.md`.\n\nPreview images will appear once a file is uploaded and run.")
 
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
 
