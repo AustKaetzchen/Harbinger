@@ -4,6 +4,7 @@ import sys
 import cv2
 import easyocr
 import math
+import json
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
@@ -122,7 +123,7 @@ def loadFont (font_size=14):
   return ImageFont.load_default()
 
 def loadReader ():
-  return easyocr.Reader(["en", "ru"])
+  return easyocr.Reader(globals()["locales"])
 
 def maskInfoboxes (img_pil):
   img_np = np.array(img_pil)
@@ -324,6 +325,8 @@ def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20, text_b
   draw_obj = ImageDraw.Draw(overlay_img)
   font_obj = loadFont(14)
 
+  label_data = []
+
   for bbox, text, prob in ocr_results:
     box_pts = [(int(pt[0]), int(pt[1])) for pt in bbox]
     draw_obj.polygon(box_pts, fill=(255, 255, 0, 80), outline=(255, 0, 0, 220))
@@ -337,6 +340,29 @@ def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20, text_b
 
     draw_obj.rectangle(text_box, fill=(255, 255, 255, 200))
     draw_obj.text(text_pos, label_text, fill=(0, 0, 0, 255), font=font_obj)
+
+    nw_pt = box_pts[0]
+    ne_pt = box_pts[1]
+    se_pt = box_pts[2]
+    sw_pt = box_pts[3]
+
+    centre_x = int(sum(pt[0] for pt in box_pts)/4)
+    centre_y = int(sum(pt[1] for pt in box_pts)/4)
+
+    label_data.append({
+      "name": text,
+      "extent": [nw_pt, ne_pt, sw_pt, se_pt],
+      "centre": [centre_x, centre_y],
+      "probability": float(prob)
+    })
+
+  if globals()["save_semantic_features"] == True:
+    os.makedirs("output", exist_ok=True)
+    json_lines = [json.dumps(item) for item in label_data]
+    json_str = "[\n  " + ",\n  ".join(json_lines) + "\n]"
+  
+    with open("output/labels.json", "w", encoding="utf-8") as f_out:
+      f_out.write(json_str)
 
   composite_img = Image.alpha_composite(final_pil, overlay_img)
   masked_img = final_pil
@@ -538,7 +564,17 @@ def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff
 
   return refined_masks
 
+def savePng (img_data, file_path):
+  if (globals()["save_output_images"] == True):
+    if isinstance(img_data, np.ndarray):
+      Image.fromarray(img_data).save(file_path, "PNG")
+    elif isinstance(img_data, Image.Image):
+      img_data.save(file_path, "PNG")
+    else:
+      Image.open(img_data).save(file_path, "PNG")
+
 def draw ():
+  os.makedirs("output", exist_ok=True)
   st.set_page_config(page_title="SRG268", layout="wide")
   st.title("(SRG268) Frame Analysis")
   st.write("Segments a map and attempts to create a detailed spatial ontology out of the map frame uploaded.")
@@ -548,19 +584,48 @@ def draw ():
   st.sidebar.subheader("Segmentation Adjustments")
   st.sidebar.caption("Thresholds are more sensitive the lower they are, and less sensitive the higher they are.\n\nIf maps have a large amount of background noise, use high thresholds.")
   mask_legends = st.sidebar.checkbox("Mask Map Legends / Infoboxes", value=True, help="Automatically detect and mask legend infoboxes.")
+  globals()["save_semantic_features"] = st.sidebar.checkbox("Save Semantic Features", value=True, help="Saves semantic features to main/output/labels.json.")
+  globals()["save_output_images"] = st.sidebar.checkbox("Save Output Images", value=True, help="Whether to save output images to the main/output/ folder.")
   colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density. Default = 15")
   density_seeding_thresh = st.sidebar.slider("Density Seeding Threshold", min_value=0, max_value=100, value=25, help="The higher this value, the denser edges need to be before new seeding takes place during final repair. Default = 25")
   edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection. Default = 20")
-  
+
   border_buffer = st.sidebar.number_input("Border Buffer", min_value=1, max_value=8, value=1, help="Determines the border padding around edges for second-pass segmentation. Default = 1")
   text_buffer = st.sidebar.number_input("Text Mask Buffer", min_value=1, max_value=50, value=8, help="Controls expansion padding around OCR text masks. Default = 8")
+  
+  available_locales = [
+    "abq", "ady", "af", "sq", "ang", "ar", "as", "ava", "az", "be",
+    "bn", "bho", "bh", "bs", "bg", "che", "ch_sim", "ch_tra", "hr", "cs",
+    "da", "dar", "nl", "en", "et", "fr", "de", "gom", "hi", "hu",
+    "is", "id", "inh", "ga", "it", "ja", "kbd", "kn", "ko", "ku",
+    "lbe", "la", "lv", "lez", "lt", "mah", "mai", "ms", "mt", "mi",
+    "mr", "mn", "sck", "ne", "new", "no", "oc", "pi", "fa", "pl",
+    "pt", "ro", "ru", "rs_cyrillic", "rs_latin", "sk", "sl", "es", "sw",
+    "sv", "tab", "tl", "tjk", "ta", "te", "th", "tr", "uk", "ur",
+    "ug", "uz", "vi", "cy"
+  ]
+  globals()["locales"] = st.sidebar.multiselect(
+    "**Locales**\n\nSee [list of supported OCR languages](https://www.jaided.ai/easyocr/).",
+    options=available_locales,
+    default=["en", "ru"],
+    help="Locales are two letter codes (i.e. en, fr, de)."
+  )
 
   if st.sidebar.button("Run") and uploaded_file is not None:
+    uploaded_file.seek(0)
+    original_img = Image.open(uploaded_file)
+    savePng(original_img, "output/1.png")
+    uploaded_file.seek(0)
+
     reader_obj = loadReader()
 
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7, col8 = st.columns(4)
     col9, col10, col11, col12 = st.columns(4)
+    
+    # Ensure output directory exists
+    if not os.path.exists("output"):
+      os.makedirs("output")
 
     with col1:
       st.subheader("1. Original Map")
@@ -569,18 +634,22 @@ def draw ():
     with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
       masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh, text_buffer, mask_legends)
 
+    savePng(preview_img, "output/2.png")
     with col2:
       st.subheader("2. UI Masking")
       st.image(preview_img, use_container_width=True)
 
+    savePng(masked_img, "output/3.png")
     with col3:
       st.subheader("3. Denoised Image")
       st.image(masked_img, use_container_width=True)
 
+    savePng(edge_vis_pil, "output/4.png")
     with col4:
       st.subheader("4. Sharpness Layer")
       st.image(edge_vis_pil, use_container_width=True)
 
+    savePng(composite_img, "output/5.png")
     with col5:
       st.subheader("5. Semantic Features")
       st.image(composite_img, use_container_width=True)
@@ -592,6 +661,7 @@ def draw ():
       alpha_mask = masked_np[:, :, 3] > 0 if masked_np.shape[2] == 4 else np.ones(final_img_np.shape[:2], dtype=bool)
 
       diversity_edges, diversity_vis_pil = buildDiversityEdgeMap(final_img_np, text_mask, river_mask, alpha_mask, text_buffer)
+      savePng(diversity_vis_pil, "output/6.png")
       st.image(diversity_vis_pil, use_container_width=True)
 
     with col7:
@@ -599,6 +669,7 @@ def draw ():
       with st.spinner("Merging regions bounded by diversity edges..."):
         refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
         segmentation_vis = renderMasks(final_img_np, refined_masks)
+        savePng(segmentation_vis, "output/7.png")
       st.image(segmentation_vis, use_container_width=True)
 
     with col8:
@@ -608,6 +679,7 @@ def draw ():
       plot8_img = (final_img_np*0.35).astype(np.uint8)
       s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
       plot8_img[s1_edges_vis] = [255, 0, 255]
+      savePng(plot8_img, "output/8.png")
       st.image(Image.fromarray(plot8_img), use_container_width=True)
 
     with col9:
@@ -663,6 +735,7 @@ def draw ():
 
       plot9_img = (final_img_np*0.35).astype(np.uint8)
       plot9_img[valid_external_edges] = [0, 255, 255]
+      savePng(plot9_img, "output/9.png")
       st.image(Image.fromarray(plot9_img), use_container_width=True)
 
     with col10:
@@ -708,6 +781,7 @@ def draw ():
             second_pass_masks.append({"segmentation": (labels_v == v), "area": v_area})
 
         segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
+        savePng(segmentation_vis_2, "output/10.png")
       st.image(segmentation_vis_2, use_container_width=True)
 
     with col11:
@@ -715,6 +789,7 @@ def draw ():
       with st.spinner("Binning bisected gap pixels to nearest second-pass neighbour..."):
         repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbours=5)
         segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
+        savePng(segmentation_vis_3, "output/11.png")
       st.image(segmentation_vis_3, use_container_width=True)
 
     with col12:
@@ -722,6 +797,7 @@ def draw ():
       with st.spinner("Binning all diversity edges to nearest segment..."):
         final_masks = repairEdgeGaps(final_img_np, repaired_masks, alpha_mask, k_neighbours=5)
         segmentation_vis_4 = renderMasks(final_img_np, final_masks)
+        savePng(segmentation_vis_4, "output/12.png")
       st.image(segmentation_vis_4, use_container_width=True)
       st.success(f"Generated {len(final_masks)} fully repaired masks.")
 
