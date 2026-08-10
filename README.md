@@ -12,12 +12,14 @@ The root app bundle is located in `./main/app.py`.
 
 Default imports:
 ```py
+import argparse
+import json
+import math
 import os
 import random
 import sys
 import cv2
 import easyocr
-import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
@@ -26,3 +28,4 @@ from scipy.stats import mode
 import streamlit as st
 from streamlit.web import cli as stcli
 ```
+Imports are not fully minimised from sam_env, so sam_env may be bigger than needed. This should be checked by Confoederatio developers in the future.
