@@ -6,6 +6,8 @@ import numpy as np
 import random
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
+from scipy.spatial import cKDTree
+from scipy.stats import mode
 import streamlit as st
 from streamlit.web import cli as stcli
 
@@ -13,25 +15,22 @@ from streamlit.web import cli as stcli
 def buildDiversityEdgeMap (img_rgb, text_mask=None, river_mask=None, alpha_mask=None):
   lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
   
-  # 1. Morphological color gradient captures all color transitions
   kernel = np.ones((3, 3), np.uint8)
   morph_grad = cv2.morphologyEx(img_rgb, cv2.MORPH_GRADIENT, kernel)
   grad_mag = np.max(morph_grad, axis=2)
-  color_transition_edges = grad_mag > 4
+  colour_transition_edges = grad_mag > 4
   
-  # 2. Dark border line detection
   lum = lab_img[:, :, 0]
   lum_blur = cv2.GaussianBlur(lum, (7, 7), 0)
   dark_lines = (lum_blur-lum) > 6
   
-  # 3. Local LAB color variance in spatial neighborhood
   local_mean = cv2.blur(lab_img, (5, 5))
   local_sqr = cv2.blur(lab_img**2, (5, 5))
   local_var = np.maximum(0, local_sqr-local_mean**2)
   local_std = np.sqrt(np.sum(local_var, axis=2))
   diversity_edges = local_std > 6.0
   
-  combined_edges = color_transition_edges | dark_lines | diversity_edges
+  combined_edges = colour_transition_edges | dark_lines | diversity_edges
   
   if text_mask is not None:
     combined_edges[text_mask] = False
@@ -48,16 +47,16 @@ def buildDiversityEdgeMap (img_rgb, text_mask=None, river_mask=None, alpha_mask=
   return edge_uint8, Image.fromarray(diversity_vis)
 
 
-def denoiseMap (img_pil, color_thresh=15, edge_thresh=20):
+def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
   img_np = np.array(img_pil)
   has_alpha = img_np.shape[2] == 4
   img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
   alpha_channel = img_np[:, :, 3] if has_alpha else np.ones(img_rgb.shape[:2], dtype=np.uint8)*255
   
-  filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, color_thresh)
+  filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, colour_thresh)
   pixels = filtered.reshape(-1, 3)
   
-  quant_step = max(1, color_thresh)
+  quant_step = max(1, colour_thresh)
   quantised_pixels = (pixels//quant_step)*quant_step
   quantised_img = quantised_pixels.reshape(img_rgb.shape)
   
@@ -74,7 +73,6 @@ def denoiseMap (img_pil, color_thresh=15, edge_thresh=20):
     if area < 10:
       bin_mask[labels == label_idx] = True
 
-  # Sample strictly from non-edge and non-transparent pixels
   valid_sources = (~bin_mask) & (alpha_channel > 0) & (edge_mask == 0)
   if not np.any(valid_sources):
     valid_sources = (alpha_channel > 0)
@@ -99,7 +97,7 @@ def draw ():
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
   
   st.sidebar.subheader("Segmentation Adjustments")
-  color_thresh = st.sidebar.slider("Color Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls color quantization density.")
+  colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density.")
   edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection.")
   
   if uploaded_file is not None:
@@ -107,14 +105,14 @@ def draw ():
     
     col1, col2, col3, col4 = st.columns(4)
     col5, col6, col7 = st.columns(3)
-    col8, col9, col10 = st.columns(3)
+    col8, col9, col10, col11 = st.columns(4)
     
     with col1:
       st.subheader("1. Original Map")
       st.image(uploaded_file, use_container_width=True)
       
     with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
-      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, color_thresh, edge_thresh)
+      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh)
       
     with col2:
       st.subheader("2. Infobox Candidates")
@@ -150,115 +148,104 @@ def draw ():
 
     with col8:
       st.subheader("8. Border Edge Layer")
-      # Extract borders (L1) from first-pass Bounded Segmentation 
-      L1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
+      l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
       for i, mask_dict in enumerate(refined_masks):
-          L1[mask_dict["segmentation"]] = i + 1
+        l1[mask_dict["segmentation"]] = i+1
           
-      h_diff = L1[:, :-1] != L1[:, 1:]
-      v_diff = L1[:-1, :] != L1[1:, :]
-      S1_edges = np.zeros_like(L1, dtype=bool)
+      h_diff = l1[:, :-1] != l1[:, 1:]
+      v_diff = l1[:-1, :] != l1[1:, :]
+      s1_edges = np.zeros_like(l1, dtype=bool)
       
-      # FIX: Assign strictly to a single axis dimension block ([:, :-1] instead of both) to completely eliminate 
-      # the "doubling up" / 2-pixel-thick line artifact, strictly enforcing a 1px boundary reference line.
-      S1_edges[:, :-1][h_diff] = True
-      S1_edges[:-1, :][v_diff] = True
+      s1_edges[:, :-1][h_diff] = True
+      s1_edges[:-1, :][v_diff] = True
       
-      plot8_img = (final_img_np * 0.35).astype(np.uint8)
-      S1_edges_vis = cv2.dilate(S1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-      plot8_img[S1_edges_vis] = [255, 0, 255] # Magenta for pure 1px edge boundaries
+      plot8_img = (final_img_np*0.35).astype(np.uint8)
+      s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+      plot8_img[s1_edges_vis] = [255, 0, 255]
       st.image(Image.fromarray(plot8_img), use_container_width=True)
 
     with col9:
       st.subheader("9. External Edges")
       
-      # Rebuild true comprehensive OCR mask directly from raw original map findings
       real_text_mask = np.zeros(final_img_np.shape[:2], dtype=np.uint8)
       for bbox, text, prob in ocr_results:
-          box_pts = np.array(bbox, dtype=np.int32)
-          cv2.fillPoly(real_text_mask, [box_pts], 255)
+        box_pts = np.array(bbox, dtype=np.int32)
+        cv2.fillPoly(real_text_mask, [box_pts], 255)
       
-      # Dilate to accommodate antialiasing bleeding entirely
       real_text_mask = cv2.dilate(real_text_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))) > 0
-      
-      # FIX: Do NOT subtract river_mask. Subtracting it previously cut chunks out of real borders 
-      # yielding highly discontinuous and jagged results. Instead, we use a fractional envelope filter below.
       raw_edges = total_edges & (~real_text_mask)
       
-      if np.any(S1_edges):
-          dist_to_S1 = distance_transform_edt(~S1_edges)
+      if np.any(s1_edges):
+        dist_to_s1 = distance_transform_edt(~s1_edges)
       else:
-          dist_to_S1 = np.full(S1_edges.shape, 1000.0)
+        dist_to_s1 = np.full(s1_edges.shape, 1000.0)
           
-      # --- GLOBAL COLOUR RANGES IMPLEMENTATION ---
-      # 1. Sample map colors exactly on the edges that strongly align with our first-pass border contours
-      strict_boundary_mask = raw_edges & (dist_to_S1 <= 2)
-      boundary_colors = final_img_np[strict_boundary_mask]
+      strict_boundary_mask = raw_edges & (dist_to_s1 <= 2)
+      boundary_colours = final_img_np[strict_boundary_mask]
       
-      if len(boundary_colors) > 0:
-          q_step = 10
-          q_colors = (boundary_colors // q_step) * q_step
-          hashes = q_colors[:,0].astype(np.int64)*65536 + q_colors[:,1].astype(np.int64)*256 + q_colors[:,2].astype(np.int64)
-          unique_hashes, counts = np.unique(hashes, return_counts=True)
-          
-          # 2. Select globally dominant border colours (ignoring small localized artifacts)
-          valid_hashes = unique_hashes[counts > 20] 
-          
-          q_img = (final_img_np // q_step) * q_step
-          img_hashes = q_img[:,:,0].astype(np.int64)*65536 + q_img[:,:,1].astype(np.int64)*256 + q_img[:,:,2].astype(np.int64)
-          valid_color_mask = np.isin(img_hashes, valid_hashes)
-          
-          # 3. Fit these global color gamut ranges back onto the post-process edges
-          color_filtered_edges = raw_edges & valid_color_mask
+      if len(boundary_colours) > 0:
+        q_step = 10
+        q_colours = (boundary_colours//q_step)*q_step
+        hashes = q_colours[:, 0].astype(np.int64)*65536 + q_colours[:, 1].astype(np.int64)*256 + q_colours[:, 2].astype(np.int64)
+        unique_hashes, counts = np.unique(hashes, return_counts=True)
+        
+        valid_hashes = unique_hashes[counts > 20] 
+        
+        q_img = (final_img_np//q_step)*q_step
+        img_hashes = q_img[:, :, 0].astype(np.int64)*65536 + q_img[:, :, 1].astype(np.int64)*256 + q_img[:, :, 2].astype(np.int64)
+        valid_colour_mask = np.isin(img_hashes, valid_hashes)
+        
+        colour_filtered_edges = raw_edges & valid_colour_mask
       else:
-          color_filtered_edges = raw_edges
+        colour_filtered_edges = raw_edges
           
-      # --- SPATIAL FILTERING & CONTINUITY PRESERVATION ---
-      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(color_filtered_edges.astype(np.uint8), connectivity=8)
-      valid_external_edges = np.zeros_like(color_filtered_edges)
+      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(colour_filtered_edges.astype(np.uint8), connectivity=8)
+      valid_external_edges = np.zeros_like(colour_filtered_edges)
       
       for i in range(1, num_labels_edges):
-          area = stats_edges[i, cv2.CC_STAT_AREA]
-          if area >= 20: 
-              component_mask = (labels_edges == i)
-              # Verify if a substantial fraction of this monolithic edge mostly hugs the region boundary 
-              # (safely filtering out interior rivers hitting the border perpendicularly without creating jagged holes)
-              close_pixels = np.sum(component_mask & (dist_to_S1 <= 3))
-              
-              if (close_pixels / area) > 0.25: 
-                  # Finally, crop out any extreme distant drifts to strictly bound the spatial envelope
-                  final_component = component_mask & (dist_to_S1 <= 15)
-                  valid_external_edges[final_component] = True
+        area = stats_edges[i, cv2.CC_STAT_AREA]
+        if area >= 20: 
+          component_mask = (labels_edges == i)
+          close_pixels = np.sum(component_mask & (dist_to_s1 <= 3))
+          
+          if (close_pixels/area) > 0.25: 
+            final_component = component_mask & (dist_to_s1 <= 15)
+            valid_external_edges[final_component] = True
                   
-      plot9_img = (final_img_np * 0.35).astype(np.uint8)
-      plot9_img[valid_external_edges] = [0, 255, 255] # Cyan for completely restored continuous edges
+      plot9_img = (final_img_np*0.35).astype(np.uint8)
+      plot9_img[valid_external_edges] = [0, 255, 255]
       st.image(Image.fromarray(plot9_img), use_container_width=True)
 
     with col10:
       st.subheader("10. Second-Pass Seg.")
       with st.spinner("Bisecting segments with validated external features..."):
-          second_pass_masks = []
+        second_pass_masks = []
+        
+        bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
+        
+        for i in range(1, len(refined_masks)+1):
+          mask_i = (l1 == i)
+          mask_i_bisected = mask_i & (~bisect_edges)
           
-          # Dilate external edge lines to ensure complete severing/bisection of L1 bodies
-          bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-          bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
+          num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
           
-          for i in range(1, len(refined_masks) + 1):
-              mask_i = (L1 == i)
-              # Second-pass correctly leverages restored external borders to intersect the first-pass mask array
-              mask_i_bisected = mask_i & (~bisect_edges)
-              
-              num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
-              
-              for j in range(1, num_sub):
-                  area = sub_stats[j, cv2.CC_STAT_AREA]
-                  if area >= 20: 
-                      sub_mask = (sub_labels == j)
-                      second_pass_masks.append({"segmentation": sub_mask, "area": area})
+          for j in range(1, num_sub):
+            area = sub_stats[j, cv2.CC_STAT_AREA]
+            if area >= 20: 
+              sub_mask = (sub_labels == j)
+              second_pass_masks.append({"segmentation": sub_mask, "area": area})
                       
-          segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
+        segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
       st.image(segmentation_vis_2, use_container_width=True)
-      st.success(f"Generated {len(second_pass_masks)} final robust masks.")
+
+    with col11:
+      st.subheader("11. Repaired Seg. (kNN)")
+      with st.spinner("Binning gap pixels to nearest second-pass neighbour..."):
+        repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbors=5)
+        segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
+      st.image(segmentation_vis_3, use_container_width=True)
+      st.success(f"Generated {len(repaired_masks)} repaired smooth masks.")
 
 
 def initApp ():
@@ -439,8 +426,8 @@ def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20):
   for label_idx in range(1, num_labels):
     mask = (labels == label_idx)
     if np.any(mask):
-      avg_color = np.mean(flat_rgb[mask], axis=0).astype(np.uint8)
-      segmented_rgb[mask] = avg_color
+      avg_colour = np.mean(flat_rgb[mask], axis=0).astype(np.uint8)
+      segmented_rgb[mask] = avg_colour
       
   edge_vis = segmented_rgb.copy()
   edge_vis[edge_cache] = [255, 0, 255]
@@ -461,13 +448,13 @@ def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20):
   return Image.fromarray(out_np), Image.fromarray(edge_vis), text_mask, river_mask, edge_cache
 
 
-def processMap (image_file, reader_obj, color_thresh=15, edge_thresh=20):
+def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20):
   img_pil = Image.open(image_file).convert("RGBA")
   img_np_rgb = np.array(img_pil.convert("RGB"))
   ocr_results = reader_obj.readtext(img_np_rgb)
   
   img_pil, preview_pil = maskInfoboxes(img_pil)
-  denoised_pil, edge_cache = denoiseMap(img_pil, color_thresh, edge_thresh)
+  denoised_pil, edge_cache = denoiseMap(img_pil, colour_thresh, edge_thresh)
   final_pil, edge_vis_pil, text_mask, river_mask, total_edges = postProcessMap(denoised_pil, reader_obj, edge_cache, edge_thresh)
   
   overlay_img = Image.new("RGBA", final_pil.size, (0, 0, 0, 0))
@@ -515,10 +502,69 @@ def renderMasks (image, masks, max_background_ratio=0.7):
   return mask_img
 
 
+def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask=None, k_neighbors=5):
+  if len(second_pass_masks) == 0:
+    return second_pass_masks
+
+  h, w = img_rgb.shape[:2]
+  
+  l1_mask = np.zeros((h, w), dtype=bool)
+  for ann in first_pass_masks:
+    l1_mask |= ann["segmentation"]
+
+  l2_map = np.zeros((h, w), dtype=np.int32)
+  for idx, ann in enumerate(second_pass_masks):
+    l2_map[ann["segmentation"]] = idx+1
+
+  if alpha_mask is not None:
+    l1_mask &= alpha_mask
+    l2_map[~alpha_mask] = 0
+
+  # Target: Pixels present in 1st pass but cut/omitted in 2nd pass
+  unassigned_mask = l1_mask & (l2_map == 0)
+  assigned_mask = l2_map > 0
+
+  if not np.any(unassigned_mask) or not np.any(assigned_mask):
+    return second_pass_masks
+
+  lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+  y_coords, x_coords = np.indices((h, w))
+  spatial_scale = 0.2
+  features = np.dstack((lab_img, y_coords*spatial_scale, x_coords*spatial_scale))
+
+  train_features = features[assigned_mask]
+  train_labels = l2_map[assigned_mask]
+  query_features = features[unassigned_mask]
+
+  tree = cKDTree(train_features)
+  _, indices = tree.query(query_features, k=k_neighbors)
+
+  if k_neighbors == 1:
+    repaired_labels = train_labels[indices]
+  else:
+    neighbor_labels = train_labels[indices]
+    mode_res, _ = mode(neighbor_labels, axis=1, keepdims=False)
+    repaired_labels = np.squeeze(mode_res)
+
+  repaired_l2_map = l2_map.copy()
+  repaired_l2_map[unassigned_mask] = repaired_labels
+
+  repaired_masks = []
+  for idx, ann in enumerate(second_pass_masks):
+    lbl = idx+1
+    m = (repaired_l2_map == lbl)
+    if alpha_mask is not None:
+      m &= alpha_mask
+    area = int(np.sum(m))
+    if area >= 20:
+      repaired_masks.append({"segmentation": m, "area": area})
+
+  return repaired_masks
+
+
 def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff=6.0):
   lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
   
-  # Fine color quantization to create distinct sub-region seed components
   quant_step = 6.0
   quant_lab = (lab_img//quant_step)*quant_step
   
@@ -529,11 +575,11 @@ def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff
   q_l = quant_lab[:, :, 0].astype(np.int32)
   q_a = quant_lab[:, :, 1].astype(np.int32)+128
   q_b = quant_lab[:, :, 2].astype(np.int32)+128
-  color_ids = q_l*1000000 + q_a*1000 + q_b
-  color_ids[inv_edges == 0] = -1
+  colour_ids = q_l*1000000 + q_a*1000 + q_b
+  colour_ids[inv_edges == 0] = -1
 
-  h_diff = (color_ids[:, :-1] != color_ids[:, 1:]) & (color_ids[:, :-1] != -1) & (color_ids[:, 1:] != -1)
-  v_diff = (color_ids[:-1, :] != color_ids[1:, :]) & (color_ids[:-1, :] != -1) & (color_ids[1:, :] != -1)
+  h_diff = (colour_ids[:, :-1] != colour_ids[:, 1:]) & (colour_ids[:, :-1] != -1) & (colour_ids[:, 1:] != -1)
+  v_diff = (colour_ids[:-1, :] != colour_ids[1:, :]) & (colour_ids[:-1, :] != -1) & (colour_ids[1:, :] != -1)
   
   split_edges = np.zeros(img_rgb.shape[:2], dtype=np.uint8)
   split_edges[:, :-1][h_diff] = 1
