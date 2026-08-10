@@ -3,6 +3,7 @@ import random
 import sys
 import cv2
 import easyocr
+import math
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
@@ -63,18 +64,18 @@ def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
   img_rgb = cv2.cvtColor(img_np, cv2.COLOR_RGBA2RGB if has_alpha else cv2.COLOR_BGR2RGB)
   alpha_channel = img_np[:, :, 3] if has_alpha else np.ones(img_rgb.shape[:2], dtype=np.uint8)*255
 
-  filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, colour_thresh) # 7 by default
+  filtered = cv2.pyrMeanShiftFiltering(img_rgb, 7, colour_thresh)
   pixels = filtered.reshape(-1, 3)
 
   quant_step = max(1, colour_thresh)
   quantised_pixels = (pixels//quant_step)*quant_step
   quantised_img = quantised_pixels.reshape(img_rgb.shape)
 
-  kernel = np.ones((3, 3), np.uint8) # (3, 3) by default
+  kernel = np.ones((3, 3), np.uint8)
   grad = cv2.morphologyEx(quantised_img, cv2.MORPH_GRADIENT, kernel)
   edge_mask = (np.max(grad, axis=2) > edge_thresh).astype(np.uint8)
 
-  num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(1 - edge_mask, connectivity=8)
+  num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(1-edge_mask, connectivity=8)
   bin_mask = np.zeros(img_rgb.shape[:2], dtype=bool)
   bin_mask[edge_mask == 1] = True
 
@@ -97,7 +98,7 @@ def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
     denoised_np = denoised_rgb
 
   return Image.fromarray(denoised_np), bin_mask
-### DENOISE END 
+### DENOISE END
 
 def draw ():
   st.set_page_config(page_title="SRG268", layout="wide")
@@ -107,11 +108,14 @@ def draw ():
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
 
   st.sidebar.subheader("Segmentation Adjustments")
+  st.sidebar.caption("Thresholds are more sensitive the lower they are, and less sensitive the higher they are.\n\nIf maps have a large amount of background noise, use high thresholds.")
   mask_legends = st.sidebar.checkbox("Mask Map Legends / Infoboxes", value=True, help="Automatically detect and mask legend infoboxes.")
-  colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density.")
-  edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection.")
-  density_seeding_thresh = st.sidebar.slider("Density Seeding Threshold", min_value=0, max_value=100, value=25, help="The higher this value, the denser edges need to be before new seeding takes place during final repair.")
-  text_buffer = st.sidebar.number_input("Text Mask Buffer", min_value=1, max_value=50, value=8, help="Controls expansion padding around OCR text masks.")
+  colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density. Default = 15")
+  density_seeding_thresh = st.sidebar.slider("Density Seeding Threshold", min_value=0, max_value=100, value=25, help="The higher this value, the denser edges need to be before new seeding takes place during final repair. Default = 25")
+  edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection. Default = 20")
+  
+  border_buffer = st.sidebar.number_input("Border Buffer", min_value=1, max_value=8, value=1, help="Determines the border padding around edges for second-pass segmentation. Default = 1")
+  text_buffer = st.sidebar.number_input("Text Mask Buffer", min_value=1, max_value=50, value=8, help="Controls expansion padding around OCR text masks. Default = 8")
 
   if uploaded_file is not None:
     reader_obj = loadReader()
@@ -161,16 +165,7 @@ def draw ():
 
     with col8:
       st.subheader("8. First-pass Filtering")
-      l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
-      for i, mask_dict in enumerate(refined_masks):
-        l1[mask_dict["segmentation"]] = i + 1
-
-      h_diff = l1[:, :-1] != l1[:, 1:]
-      v_diff = l1[:-1, :] != l1[1:, :]
-      s1_edges = np.zeros_like(l1, dtype=bool)
-
-      s1_edges[:, :-1][h_diff] = True
-      s1_edges[:-1, :][v_diff] = True
+      s1_edges = diversity_edges > 0
 
       plot8_img = (final_img_np*0.35).astype(np.uint8)
       s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
@@ -194,7 +189,7 @@ def draw ():
       else:
         dist_to_s1 = np.full(s1_edges.shape, 1000.0)
 
-      strict_boundary_mask = raw_edges & (dist_to_s1 <= 2)
+      strict_boundary_mask = raw_edges & (dist_to_s1 <= math.ceil(border_buffer/2))
       boundary_colours = final_img_np[strict_boundary_mask]
 
       if len(boundary_colours) > 0:
@@ -220,7 +215,7 @@ def draw ():
         area = stats_edges[i, cv2.CC_STAT_AREA]
         if area >= 10:
           component_mask = (labels_edges == i)
-          close_pixels = np.sum(component_mask & (dist_to_s1 <= 4))
+          close_pixels = np.sum(component_mask & (dist_to_s1 <= border_buffer))
 
           if close_pixels > 0 and (close_pixels/area) > 0.05:
             valid_external_edges[component_mask] = True
@@ -243,7 +238,11 @@ def draw ():
         edge_density = cv2.blur(valid_external_edges.astype(np.float32), (31, 31))
         dense_enclaves = edge_density > density_seeding_thresh/100
 
-        for i in range(1, len(refined_masks) + 1):
+        l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
+        for i, mask_dict in enumerate(refined_masks):
+          l1[mask_dict["segmentation"]] = i+1
+
+        for i in range(1, len(refined_masks)+1):
           mask_i = (l1 == i)
           mask_i_bisected = mask_i & (~bisect_edges)
 
@@ -349,7 +348,7 @@ def maskInfoboxes (img_pil):
 
     for colour in top_colours:
       lower = np.clip(colour, 0, 255).astype(np.uint8)
-      upper = np.clip(colour + bin_size - 1, 0, 255).astype(np.uint8)
+      upper = np.clip(colour+bin_size-1, 0, 255).astype(np.uint8)
       colour_mask = cv2.inRange(quantised, lower, upper)
       colour_mask = cv2.morphologyEx(colour_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
       cnts, _ = cv2.findContours(colour_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -373,7 +372,7 @@ def maskInfoboxes (img_pil):
       peri = cv2.arcLength(cnt, True)
       approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
       if len(approx) <= 8:
-        cv2.rectangle(mask_rects_pad, (x, y), (x + w, y + h), 255, -1)
+        cv2.rectangle(mask_rects_pad, (x, y), (x+w, y+h), 255, -1)
 
   mask_rects = mask_rects_pad[pad:-pad, pad:-pad]
   close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
@@ -408,9 +407,9 @@ def maskInfoboxes (img_pil):
     x, y, w, h = cv2.boundingRect(cnt)
     text = "Masked UI"
     text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-    tx = x + (w - text_size[0])//2
-    ty = y + (h + text_size[1])//2
-    cv2.rectangle(preview_img, (tx - 2, ty - text_size[1] - 2), (tx + text_size[0] + 2, ty + 2), (0, 0, 0), -1)
+    tx = x + (w-text_size[0])//2
+    ty = y + (h+text_size[1])//2
+    cv2.rectangle(preview_img, (tx-2, ty-text_size[1]-2), (tx+text_size[0]+2, ty+2), (0, 0, 0), -1)
     cv2.putText(preview_img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
   img_np[final_mask == 255] = (0, 0, 0, 0)
@@ -526,7 +525,7 @@ def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20, text_b
     min_x = min(pt[0] for pt in box_pts)
     min_y = min(pt[1] for pt in box_pts)
 
-    text_pos = (min_x, max(0, min_y - 16))
+    text_pos = (min_x, max(0, min_y-16))
     text_box = draw_obj.textbbox(text_pos, label_text, font=font_obj)
 
     draw_obj.rectangle(text_box, fill=(255, 255, 255, 200))
@@ -566,7 +565,7 @@ def repairEdgeGaps (img_rgb, masks, alpha_mask=None, k_neighbours=5):
   h, w = img_rgb.shape[:2]
   l3_map = np.zeros((h, w), dtype=np.int32)
   for idx, ann in enumerate(masks):
-    l3_map[ann["segmentation"]] = idx + 1
+    l3_map[ann["segmentation"]] = idx+1
 
   if alpha_mask is not None:
     l3_map[~alpha_mask] = 0
@@ -605,7 +604,7 @@ def repairEdgeGaps (img_rgb, masks, alpha_mask=None, k_neighbours=5):
 
   final_masks = []
   for idx, ann in enumerate(masks):
-    lbl = idx + 1
+    lbl = idx+1
     m = (repaired_l3_map == lbl)
     if alpha_mask is not None:
       m &= alpha_mask
@@ -628,7 +627,7 @@ def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask
 
   l2_map = np.zeros((h, w), dtype=np.int32)
   for idx, ann in enumerate(second_pass_masks):
-    l2_map[ann["segmentation"]] = idx + 1
+    l2_map[ann["segmentation"]] = idx+1
 
   if alpha_mask is not None:
     l1_mask &= alpha_mask
@@ -664,7 +663,7 @@ def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask
 
   repaired_masks = []
   for idx, ann in enumerate(second_pass_masks):
-    lbl = idx + 1
+    lbl = idx+1
     m = (repaired_l2_map == lbl)
     if alpha_mask is not None:
       m &= alpha_mask
@@ -678,7 +677,7 @@ def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask
 def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff=6.0):
   lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
 
-  inv_edges = (1 - edge_mask).astype(np.uint8)
+  inv_edges = (1-edge_mask).astype(np.uint8)
   if alpha_mask is not None:
     inv_edges[~alpha_mask] = 0
 
@@ -716,7 +715,7 @@ def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff
   for u, v in unique_pairs:
     ru, rv = findRoot(u), findRoot(v)
     if ru != rv and ru in region_means and rv in region_means:
-      dist = np.linalg.norm(region_means[ru] - region_means[rv])
+      dist = np.linalg.norm(region_means[ru]-region_means[rv])
       if dist < max_colour_diff:
         merged_labels[rv] = ru
 
