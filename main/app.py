@@ -155,7 +155,7 @@ def drawGui ():
 
     with col1:
       st.subheader("1. Original Map")
-      st.image(uploaded_file, use_container_width=True)
+      st.image(uploaded_file, width="stretch")
 
     with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
       masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh, text_buffer, mask_legends)
@@ -163,22 +163,22 @@ def drawGui ():
     savePng(preview_img, "output/2.png")
     with col2:
       st.subheader("2. UI Masking")
-      st.image(preview_img, use_container_width=True)
+      st.image(preview_img, width="stretch")
 
     savePng(masked_img, "output/3.png")
     with col3:
       st.subheader("3. Denoised Image")
-      st.image(masked_img, use_container_width=True)
+      st.image(masked_img, width="stretch")
 
     savePng(edge_vis_pil, "output/4.png")
     with col4:
       st.subheader("4. Sharpness Layer")
-      st.image(edge_vis_pil, use_container_width=True)
+      st.image(edge_vis_pil, width="stretch")
 
     savePng(composite_img, "output/5.png")
     with col5:
       st.subheader("5. Semantic Features")
-      st.image(composite_img, use_container_width=True)
+      st.image(composite_img, width="stretch")
 
     with col6:
       st.subheader("6. Denoised Edges")
@@ -188,7 +188,7 @@ def drawGui ():
 
       diversity_edges, diversity_vis_pil = buildDiversityEdgeMap(final_img_np, text_mask, river_mask, alpha_mask, text_buffer)
       savePng(diversity_vis_pil, "output/6.png")
-      st.image(diversity_vis_pil, use_container_width=True)
+      st.image(diversity_vis_pil, width="stretch")
 
     with col7:
       st.subheader("7. First-pass Segmentation")
@@ -196,7 +196,7 @@ def drawGui ():
         refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
         segmentation_vis = renderMasks(final_img_np, refined_masks)
         savePng(segmentation_vis, "output/7.png")
-      st.image(segmentation_vis, use_container_width=True)
+      st.image(segmentation_vis, width="stretch")
 
     with col8:
       st.subheader("8. First-pass Filtering")
@@ -206,7 +206,7 @@ def drawGui ():
       s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
       plot8_img[s1_edges_vis] = [255, 0, 255]
       savePng(plot8_img, "output/8.png")
-      st.image(Image.fromarray(plot8_img), use_container_width=True)
+      st.image(Image.fromarray(plot8_img), width="stretch")
 
     with col9:
       st.subheader("9. Edge Restoration")
@@ -262,7 +262,7 @@ def drawGui ():
       plot9_img = (final_img_np*0.35).astype(np.uint8)
       plot9_img[valid_external_edges] = [0, 255, 255]
       savePng(plot9_img, "output/9.png")
-      st.image(Image.fromarray(plot9_img), use_container_width=True)
+      st.image(Image.fromarray(plot9_img), width="stretch")
 
     with col10:
       st.subheader("10. Second-pass Segmentation")
@@ -308,7 +308,7 @@ def drawGui ():
 
         segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
         savePng(segmentation_vis_2, "output/10.png")
-      st.image(segmentation_vis_2, use_container_width=True)
+      st.image(segmentation_vis_2, width="stretch")
 
     with col11:
       st.subheader("11. First-pass kNN Repair")
@@ -316,7 +316,7 @@ def drawGui ():
         repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbours=5)
         segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
         savePng(segmentation_vis_3, "output/11.png")
-      st.image(segmentation_vis_3, use_container_width=True)
+      st.image(segmentation_vis_3, width="stretch")
 
     with col12:
       st.subheader("12. Second-pass kNN Repair")
@@ -324,7 +324,7 @@ def drawGui ():
         final_masks = repairEdgeGaps(final_img_np, repaired_masks, alpha_mask, k_neighbours=5)
         segmentation_vis_4 = renderMasks(final_img_np, final_masks)
         savePng(segmentation_vis_4, "output/12.png")
-      st.image(segmentation_vis_4, use_container_width=True)
+      st.image(segmentation_vis_4, width="stretch")
       st.success(f"Generated {len(final_masks)} fully repaired masks.")
 
 def initApp ():
