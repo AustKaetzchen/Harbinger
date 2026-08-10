@@ -1,8 +1,14 @@
 # SRG268
 Special Research Group 268
 
-Anaconda commands to ensure accurate dependencies:
-1. `conda activate sam_env`
+Requirements:
+1. Ensure Anaconda is installed such that you have access to Anaconda Prompt:
+2. Run Anaconda As Administrator > `conda init cmd.exe` to tie it to your Command Prompt system.
+3. Restart Command Prompt (Administrator)
+4. `conda env create -f environment.yml` (Installs all Python dependencies)
+5. `conda activate sam_env` (Ensures accurate dependencies once installed)
+
+The root app bundle is located in `./main/app.py`.
 
 Default imports:
 ```py

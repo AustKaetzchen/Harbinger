@@ -1,10 +1,11 @@
+import argparse
+import json
+import math
 import os
 import random
 import sys
 import cv2
 import easyocr
-import math
-import json
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
@@ -14,7 +15,6 @@ import streamlit as st
 from streamlit.web import cli as stcli
 
 @st.cache_resource
-
 def buildDiversityEdgeMap (img_rgb, text_mask=None, river_mask=None, alpha_mask=None, text_buffer=7):
   lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
 
@@ -59,7 +59,6 @@ def buildDiversityEdgeMap (img_rgb, text_mask=None, river_mask=None, alpha_mask=
 
   return edge_uint8, Image.fromarray(diversity_vis)
 
-### DENOISE START
 def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
   img_np = np.array(img_pil)
   has_alpha = img_np.shape[2] == 4
@@ -100,7 +99,233 @@ def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
     denoised_np = denoised_rgb
 
   return Image.fromarray(denoised_np), bin_mask
-### DENOISE END
+
+def drawGui ():
+  os.makedirs("output", exist_ok=True)
+  st.set_page_config(page_title="SRG268", layout="wide")
+  st.title("(SRG268) Frame Analysis")
+  st.write("Segments a map and attempts to create a detailed spatial ontology out of the map frame uploaded.")
+
+  uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
+
+  st.sidebar.subheader("Segmentation Adjustments")
+  st.sidebar.caption("Thresholds are more sensitive the lower they are, and less sensitive the higher they are.\n\nIf maps have a large amount of background noise, use high thresholds.")
+  mask_legends = st.sidebar.checkbox("Mask Map Legends / Infoboxes", value=True, help="Automatically detect and mask legend infoboxes.")
+  globals()["save_semantic_features"] = st.sidebar.checkbox("Save Semantic Features", value=True, help="Saves semantic features to main/output/labels.json.")
+  globals()["save_output_images"] = st.sidebar.checkbox("Save Output Images", value=True, help="Whether to save output images to the main/output/ folder.")
+  colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density. Default = 15")
+  density_seeding_thresh = st.sidebar.slider("Density Seeding Threshold", min_value=0, max_value=100, value=25, help="The higher this value, the denser edges need to be before new seeding takes place during final repair. Default = 25")
+  edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection. Default = 20")
+
+  border_buffer = st.sidebar.number_input("Border Buffer", min_value=1, max_value=8, value=1, help="Determines the border padding around edges for second-pass segmentation. Default = 1")
+  text_buffer = st.sidebar.number_input("Text Mask Buffer", min_value=1, max_value=50, value=8, help="Controls expansion padding around OCR text masks. Default = 8")
+  
+  available_locales = [
+    "abq", "ady", "af", "sq", "ang", "ar", "as", "ava", "az", "be",
+    "bn", "bho", "bh", "bs", "bg", "che", "ch_sim", "ch_tra", "hr", "cs",
+    "da", "dar", "nl", "en", "et", "fr", "de", "gom", "hi", "hu",
+    "is", "id", "inh", "ga", "it", "ja", "kbd", "kn", "ko", "ku",
+    "lbe", "la", "lv", "lez", "lt", "mah", "mai", "ms", "mt", "mi",
+    "mr", "mn", "sck", "ne", "new", "no", "oc", "pi", "fa", "pl",
+    "pt", "ro", "ru", "rs_cyrillic", "rs_latin", "sk", "sl", "es", "sw",
+    "sv", "tab", "tl", "tjk", "ta", "te", "th", "tr", "uk", "ur",
+    "ug", "uz", "vi", "cy"
+  ]
+  globals()["locales"] = st.sidebar.multiselect(
+    "**Locales**\n\nSee [list of supported OCR languages](https://www.jaided.ai/easyocr/).",
+    options=available_locales,
+    default=["en", "ru"],
+    help="Locales are two letter codes (i.e. en, fr, de)."
+  )
+
+  if st.sidebar.button("Run") and uploaded_file is not None:
+    uploaded_file.seek(0)
+    original_img = Image.open(uploaded_file)
+    savePng(original_img, "output/1.png")
+    uploaded_file.seek(0)
+
+    reader_obj = loadReader()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col5, col6, col7, col8 = st.columns(4)
+    col9, col10, col11, col12 = st.columns(4)
+
+    if not os.path.exists("output"):
+      os.makedirs("output")
+
+    with col1:
+      st.subheader("1. Original Map")
+      st.image(uploaded_file, use_container_width=True)
+
+    with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
+      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh, text_buffer, mask_legends)
+
+    savePng(preview_img, "output/2.png")
+    with col2:
+      st.subheader("2. UI Masking")
+      st.image(preview_img, use_container_width=True)
+
+    savePng(masked_img, "output/3.png")
+    with col3:
+      st.subheader("3. Denoised Image")
+      st.image(masked_img, use_container_width=True)
+
+    savePng(edge_vis_pil, "output/4.png")
+    with col4:
+      st.subheader("4. Sharpness Layer")
+      st.image(edge_vis_pil, use_container_width=True)
+
+    savePng(composite_img, "output/5.png")
+    with col5:
+      st.subheader("5. Semantic Features")
+      st.image(composite_img, use_container_width=True)
+
+    with col6:
+      st.subheader("6. Denoised Edges")
+      final_img_np = np.array(masked_img.convert("RGB"))
+      masked_np = np.array(masked_img)
+      alpha_mask = masked_np[:, :, 3] > 0 if masked_np.shape[2] == 4 else np.ones(final_img_np.shape[:2], dtype=bool)
+
+      diversity_edges, diversity_vis_pil = buildDiversityEdgeMap(final_img_np, text_mask, river_mask, alpha_mask, text_buffer)
+      savePng(diversity_vis_pil, "output/6.png")
+      st.image(diversity_vis_pil, use_container_width=True)
+
+    with col7:
+      st.subheader("7. First-pass Segmentation")
+      with st.spinner("Merging regions bounded by diversity edges..."):
+        refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
+        segmentation_vis = renderMasks(final_img_np, refined_masks)
+        savePng(segmentation_vis, "output/7.png")
+      st.image(segmentation_vis, use_container_width=True)
+
+    with col8:
+      st.subheader("8. First-pass Filtering")
+      s1_edges = diversity_edges > 0
+
+      plot8_img = (final_img_np*0.35).astype(np.uint8)
+      s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+      plot8_img[s1_edges_vis] = [255, 0, 255]
+      savePng(plot8_img, "output/8.png")
+      st.image(Image.fromarray(plot8_img), use_container_width=True)
+
+    with col9:
+      st.subheader("9. Edge Restoration")
+
+      real_text_mask = np.zeros(final_img_np.shape[:2], dtype=np.uint8)
+      for bbox, text, prob in ocr_results:
+        box_pts = np.array(bbox, dtype=np.int32)
+        cv2.fillPoly(real_text_mask, [box_pts], 255)
+
+      text_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (text_buffer, text_buffer))
+      real_text_mask = cv2.dilate(real_text_mask, text_kernel) > 0
+      raw_edges = total_edges & (~real_text_mask)
+
+      if np.any(s1_edges):
+        dist_to_s1 = distance_transform_edt(~s1_edges)
+      else:
+        dist_to_s1 = np.full(s1_edges.shape, 1000.0)
+
+      strict_boundary_mask = raw_edges & (dist_to_s1 <= math.ceil(border_buffer/2))
+      boundary_colours = final_img_np[strict_boundary_mask]
+
+      if len(boundary_colours) > 0:
+        q_step = 10
+        q_colours = (boundary_colours//q_step)*q_step
+        hashes = q_colours[:, 0].astype(np.int64)*65536+q_colours[:, 1].astype(np.int64)*256+q_colours[:, 2].astype(np.int64)
+        unique_hashes, counts = np.unique(hashes, return_counts=True)
+
+        valid_hashes = unique_hashes[counts > 20]
+
+        q_img = (final_img_np//q_step)*q_step
+        img_hashes = q_img[:, :, 0].astype(np.int64)*65536+q_img[:, :, 1].astype(np.int64)*256+q_img[:, :, 2].astype(np.int64)
+        valid_colour_mask = np.isin(img_hashes, valid_hashes)
+
+        colour_filtered_edges = raw_edges & valid_colour_mask
+      else:
+        colour_filtered_edges = raw_edges
+
+      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(colour_filtered_edges.astype(np.uint8), connectivity=8)
+      valid_external_edges = np.zeros_like(colour_filtered_edges)
+
+      for i in range(1, num_labels_edges):
+        area = stats_edges[i, cv2.CC_STAT_AREA]
+        if area >= 10:
+          component_mask = (labels_edges == i)
+          close_pixels = np.sum(component_mask & (dist_to_s1 <= border_buffer))
+
+          if close_pixels > 0 and (close_pixels/area) > 0.05:
+            valid_external_edges[component_mask] = True
+
+      close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+      valid_external_edges = cv2.morphologyEx(valid_external_edges.astype(np.uint8), cv2.MORPH_CLOSE, close_kernel) > 0
+
+      plot9_img = (final_img_np*0.35).astype(np.uint8)
+      plot9_img[valid_external_edges] = [0, 255, 255]
+      savePng(plot9_img, "output/9.png")
+      st.image(Image.fromarray(plot9_img), use_container_width=True)
+
+    with col10:
+      st.subheader("10. Second-pass Segmentation")
+      with st.spinner("Bisecting segments with validated external features..."):
+        second_pass_masks = []
+
+        bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
+
+        edge_density = cv2.blur(valid_external_edges.astype(np.float32), (31, 31))
+        dense_enclaves = edge_density > density_seeding_thresh/100
+
+        l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
+        for i, mask_dict in enumerate(refined_masks):
+          l1[mask_dict["segmentation"]] = i+1
+
+        for i in range(1, len(refined_masks)+1):
+          mask_i = (l1 == i)
+          mask_i_bisected = mask_i & (~bisect_edges)
+
+          num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
+
+          for j in range(1, num_sub):
+            area = sub_stats[j, cv2.CC_STAT_AREA]
+            sub_mask = (sub_labels == j)
+            is_dense = np.any(sub_mask & dense_enclaves)
+
+            min_area = 5 if is_dense else 20
+            if area >= min_area:
+              second_pass_masks.append({"segmentation": sub_mask, "area": area})
+
+        assigned_sp = np.zeros(final_img_np.shape[:2], dtype=bool)
+        for ann in second_pass_masks:
+          assigned_sp |= ann["segmentation"]
+
+        void_mask = alpha_mask & (~assigned_sp) & (~bisect_edges) & dense_enclaves
+        num_v, labels_v, stats_v, _ = cv2.connectedComponentsWithStats(void_mask.astype(np.uint8), connectivity=4)
+
+        for v in range(1, num_v):
+          v_area = stats_v[v, cv2.CC_STAT_AREA]
+          if v_area >= 5:
+            second_pass_masks.append({"segmentation": (labels_v == v), "area": v_area})
+
+        segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
+        savePng(segmentation_vis_2, "output/10.png")
+      st.image(segmentation_vis_2, use_container_width=True)
+
+    with col11:
+      st.subheader("11. First-pass kNN Repair")
+      with st.spinner("Binning bisected gap pixels to nearest second-pass neighbour..."):
+        repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbours=5)
+        segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
+        savePng(segmentation_vis_3, "output/11.png")
+      st.image(segmentation_vis_3, use_container_width=True)
+
+    with col12:
+      st.subheader("12. Second-pass kNN Repair")
+      with st.spinner("Binning all diversity edges to nearest segment..."):
+        final_masks = repairEdgeGaps(final_img_np, repaired_masks, alpha_mask, k_neighbours=5)
+        segmentation_vis_4 = renderMasks(final_img_np, final_masks)
+        savePng(segmentation_vis_4, "output/12.png")
+      st.image(segmentation_vis_4, use_container_width=True)
+      st.success(f"Generated {len(final_masks)} fully repaired masks.")
 
 def initApp ():
   sys.argv = ["streamlit", "run", __file__]
@@ -217,13 +442,31 @@ def maskInfoboxes (img_pil):
     x, y, w, h = cv2.boundingRect(cnt)
     text = "Masked UI"
     text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-    tx = x + (w-text_size[0])//2
-    ty = y + (h+text_size[1])//2
+    tx = x+(w-text_size[0])//2
+    ty = y+(h+text_size[1])//2
     cv2.rectangle(preview_img, (tx-2, ty-text_size[1]-2), (tx+text_size[0]+2, ty+2), (0, 0, 0), -1)
     cv2.putText(preview_img, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
   img_np[final_mask == 255] = (0, 0, 0, 0)
   return Image.fromarray(img_np), Image.fromarray(preview_img)
+
+def parseArgs ():
+  parser = argparse.ArgumentParser(description="SRG268 Frame Analysis CLI")
+  parser.add_argument("-i", "--input", type=str, default=None, help="Path to input map image.")
+  parser.add_argument("-o", "--output-dir", type=str, default="output", help="Directory where output images and JSON will be saved.")
+  parser.add_argument("--gui", action="store_true", help="Launch Streamlit GUI explicitly.")
+  parser.add_argument("--mask-legends", action=argparse.BooleanOptionalAction, default=True, help="Automatically detect and mask legend infoboxes.")
+  parser.add_argument("--save-semantic-features", action=argparse.BooleanOptionalAction, default=True, help="Save semantic features to output/labels.json.")
+  parser.add_argument("--save-output-images", action=argparse.BooleanOptionalAction, default=True, help="Save intermediate pipeline images to output folder.")
+  parser.add_argument("--colour-thresh", type=int, default=15, help="Colour similarity threshold (1-50). Default = 15")
+  parser.add_argument("--density-seeding-thresh", type=int, default=25, help="Density seeding threshold (0-100). Default = 25")
+  parser.add_argument("--edge-thresh", type=int, default=20, help="Edge gradient threshold (1-50). Default = 20")
+  parser.add_argument("--border-buffer", type=int, default=1, help="Border buffer padding (1-8). Default = 1")
+  parser.add_argument("--text-buffer", type=int, default=8, help="Text mask buffer padding (1-50). Default = 8")
+  parser.add_argument("--locales", nargs="+", default=["en", "ru"], help="Locales code list for EasyOCR.")
+  if st.runtime.exists():
+    return parser.parse_known_args()[0]
+  return parser.parse_args()
 
 def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20, text_buffer=7):
   img_np = np.array(img_pil)
@@ -356,12 +599,13 @@ def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20, text_b
       "probability": float(prob)
     })
 
-  if globals()["save_semantic_features"] == True:
-    os.makedirs("output", exist_ok=True)
+  if globals().get("save_semantic_features", True):
+    out_dir = globals().get("current_output_dir", "output")
+    os.makedirs(out_dir, exist_ok=True)
     json_lines = [json.dumps(item) for item in label_data]
     json_str = "[\n  " + ",\n  ".join(json_lines) + "\n]"
-  
-    with open("output/labels.json", "w", encoding="utf-8") as f_out:
+
+    with open(os.path.join(out_dir, "labels.json"), "w", encoding="utf-8") as f_out:
       f_out.write(json_str)
 
   composite_img = Image.alpha_composite(final_pil, overlay_img)
@@ -503,6 +747,168 @@ def repairSegmentation (img_rgb, first_pass_masks, second_pass_masks, alpha_mask
 
   return repaired_masks
 
+def runCli (args):
+  out_dir = args.output_dir
+  os.makedirs(out_dir, exist_ok=True)
+  globals()["save_semantic_features"] = args.save_semantic_features
+  globals()["save_output_images"] = args.save_output_images
+  globals()["locales"] = args.locales
+  globals()["current_output_dir"] = out_dir
+
+  print(f"[+] Processing map image: {args.input}")
+  original_img = Image.open(args.input)
+  savePng(original_img, os.path.join(out_dir, "1.png"))
+
+  print("[+] Initialising OCR engine...")
+  reader_obj = loadReader()
+
+  print("[+] Running OCR and layout masking...")
+  masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(
+    args.input, reader_obj, args.colour_thresh, args.edge_thresh, args.text_buffer, args.mask_legends
+  )
+
+  savePng(preview_img, os.path.join(out_dir, "2.png"))
+  savePng(masked_img, os.path.join(out_dir, "3.png"))
+  savePng(edge_vis_pil, os.path.join(out_dir, "4.png"))
+  savePng(composite_img, os.path.join(out_dir, "5.png"))
+
+  print("[+] Constructing diversity edge map...")
+  final_img_np = np.array(masked_img.convert("RGB"))
+  masked_np = np.array(masked_img)
+  alpha_mask = masked_np[:, :, 3] > 0 if masked_np.shape[2] == 4 else np.ones(final_img_np.shape[:2], dtype=bool)
+
+  diversity_edges, diversity_vis_pil = buildDiversityEdgeMap(final_img_np, text_mask, river_mask, alpha_mask, args.text_buffer)
+  savePng(diversity_vis_pil, os.path.join(out_dir, "6.png"))
+
+  print("[+] Executing first-pass segmentation...")
+  refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
+  segmentation_vis = renderMasks(final_img_np, refined_masks)
+  savePng(segmentation_vis, os.path.join(out_dir, "7.png"))
+
+  print("[+] Applying edge filtering...")
+  s1_edges = diversity_edges > 0
+  plot8_img = (final_img_np*0.35).astype(np.uint8)
+  s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+  plot8_img[s1_edges_vis] = [255, 0, 255]
+  savePng(plot8_img, os.path.join(out_dir, "8.png"))
+
+  print("[+] Performing edge restoration...")
+  real_text_mask = np.zeros(final_img_np.shape[:2], dtype=np.uint8)
+  for bbox, text, prob in ocr_results:
+    box_pts = np.array(bbox, dtype=np.int32)
+    cv2.fillPoly(real_text_mask, [box_pts], 255)
+
+  text_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (args.text_buffer, args.text_buffer))
+  real_text_mask = cv2.dilate(real_text_mask, text_kernel) > 0
+  raw_edges = total_edges & (~real_text_mask)
+
+  if np.any(s1_edges):
+    dist_to_s1 = distance_transform_edt(~s1_edges)
+  else:
+    dist_to_s1 = np.full(s1_edges.shape, 1000.0)
+
+  strict_boundary_mask = raw_edges & (dist_to_s1 <= math.ceil(args.border_buffer/2))
+  boundary_colours = final_img_np[strict_boundary_mask]
+
+  if len(boundary_colours) > 0:
+    q_step = 10
+    q_colours = (boundary_colours//q_step)*q_step
+    hashes = q_colours[:, 0].astype(np.int64)*65536+q_colours[:, 1].astype(np.int64)*256+q_colours[:, 2].astype(np.int64)
+    unique_hashes, counts = np.unique(hashes, return_counts=True)
+
+    valid_hashes = unique_hashes[counts > 20]
+
+    q_img = (final_img_np//q_step)*q_step
+    img_hashes = q_img[:, :, 0].astype(np.int64)*65536+q_img[:, :, 1].astype(np.int64)*256+q_img[:, :, 2].astype(np.int64)
+    valid_colour_mask = np.isin(img_hashes, valid_hashes)
+
+    colour_filtered_edges = raw_edges & valid_colour_mask
+  else:
+    colour_filtered_edges = raw_edges
+
+  num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(colour_filtered_edges.astype(np.uint8), connectivity=8)
+  valid_external_edges = np.zeros_like(colour_filtered_edges)
+
+  for i in range(1, num_labels_edges):
+    area = stats_edges[i, cv2.CC_STAT_AREA]
+    if area >= 10:
+      component_mask = (labels_edges == i)
+      close_pixels = np.sum(component_mask & (dist_to_s1 <= args.border_buffer))
+
+      if close_pixels > 0 and (close_pixels/area) > 0.05:
+        valid_external_edges[component_mask] = True
+
+  close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+  valid_external_edges = cv2.morphologyEx(valid_external_edges.astype(np.uint8), cv2.MORPH_CLOSE, close_kernel) > 0
+
+  plot9_img = (final_img_np*0.35).astype(np.uint8)
+  plot9_img[valid_external_edges] = [0, 255, 255]
+  savePng(plot9_img, os.path.join(out_dir, "9.png"))
+
+  print("[+] Executing second-pass segmentation...")
+  second_pass_masks = []
+
+  bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+  bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
+
+  edge_density = cv2.blur(valid_external_edges.astype(np.float32), (31, 31))
+  dense_enclaves = edge_density > args.density_seeding_thresh/100
+
+  l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
+  for i, mask_dict in enumerate(refined_masks):
+    l1[mask_dict["segmentation"]] = i+1
+
+  for i in range(1, len(refined_masks)+1):
+    mask_i = (l1 == i)
+    mask_i_bisected = mask_i & (~bisect_edges)
+
+    num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
+
+    for j in range(1, num_sub):
+      area = sub_stats[j, cv2.CC_STAT_AREA]
+      sub_mask = (sub_labels == j)
+      is_dense = np.any(sub_mask & dense_enclaves)
+
+      min_area = 5 if is_dense else 20
+      if area >= min_area:
+        second_pass_masks.append({"segmentation": sub_mask, "area": area})
+
+  assigned_sp = np.zeros(final_img_np.shape[:2], dtype=bool)
+  for ann in second_pass_masks:
+    assigned_sp |= ann["segmentation"]
+
+  void_mask = alpha_mask & (~assigned_sp) & (~bisect_edges) & dense_enclaves
+  num_v, labels_v, stats_v, _ = cv2.connectedComponentsWithStats(void_mask.astype(np.uint8), connectivity=4)
+
+  for v in range(1, num_v):
+    v_area = stats_v[v, cv2.CC_STAT_AREA]
+    if v_area >= 5:
+      second_pass_masks.append({"segmentation": (labels_v == v), "area": v_area})
+
+  segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
+  savePng(segmentation_vis_2, os.path.join(out_dir, "10.png"))
+
+  print("[+] Running first-pass kNN repair...")
+  repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbours=5)
+  segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
+  savePng(segmentation_vis_3, os.path.join(out_dir, "11.png"))
+
+  print("[+] Running second-pass kNN repair...")
+  final_masks = repairEdgeGaps(final_img_np, repaired_masks, alpha_mask, k_neighbours=5)
+  segmentation_vis_4 = renderMasks(final_img_np, final_masks)
+  savePng(segmentation_vis_4, os.path.join(out_dir, "12.png"))
+
+  print(f"[+] Complete! Generated {len(final_masks)} fully repaired masks in '{out_dir}'.")
+
+def savePng (img_data, file_path):
+  if globals().get("save_output_images", True):
+    if isinstance(img_data, np.ndarray):
+      Image.fromarray(img_data).save(file_path, "PNG")
+    elif isinstance(img_data, Image.Image):
+      img_data.save(file_path, "PNG")
+    else:
+      Image.open(img_data).save(file_path, "PNG")
+
 def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff=6.0):
   lab_img = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
 
@@ -564,243 +970,12 @@ def segmentAndMergeRegions (img_rgb, edge_mask, alpha_mask=None, max_colour_diff
 
   return refined_masks
 
-def savePng (img_data, file_path):
-  if (globals()["save_output_images"] == True):
-    if isinstance(img_data, np.ndarray):
-      Image.fromarray(img_data).save(file_path, "PNG")
-    elif isinstance(img_data, Image.Image):
-      img_data.save(file_path, "PNG")
-    else:
-      Image.open(img_data).save(file_path, "PNG")
-
-def draw ():
-  os.makedirs("output", exist_ok=True)
-  st.set_page_config(page_title="SRG268", layout="wide")
-  st.title("(SRG268) Frame Analysis")
-  st.write("Segments a map and attempts to create a detailed spatial ontology out of the map frame uploaded.")
-
-  uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
-
-  st.sidebar.subheader("Segmentation Adjustments")
-  st.sidebar.caption("Thresholds are more sensitive the lower they are, and less sensitive the higher they are.\n\nIf maps have a large amount of background noise, use high thresholds.")
-  mask_legends = st.sidebar.checkbox("Mask Map Legends / Infoboxes", value=True, help="Automatically detect and mask legend infoboxes.")
-  globals()["save_semantic_features"] = st.sidebar.checkbox("Save Semantic Features", value=True, help="Saves semantic features to main/output/labels.json.")
-  globals()["save_output_images"] = st.sidebar.checkbox("Save Output Images", value=True, help="Whether to save output images to the main/output/ folder.")
-  colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density. Default = 15")
-  density_seeding_thresh = st.sidebar.slider("Density Seeding Threshold", min_value=0, max_value=100, value=25, help="The higher this value, the denser edges need to be before new seeding takes place during final repair. Default = 25")
-  edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection. Default = 20")
-
-  border_buffer = st.sidebar.number_input("Border Buffer", min_value=1, max_value=8, value=1, help="Determines the border padding around edges for second-pass segmentation. Default = 1")
-  text_buffer = st.sidebar.number_input("Text Mask Buffer", min_value=1, max_value=50, value=8, help="Controls expansion padding around OCR text masks. Default = 8")
-  
-  available_locales = [
-    "abq", "ady", "af", "sq", "ang", "ar", "as", "ava", "az", "be",
-    "bn", "bho", "bh", "bs", "bg", "che", "ch_sim", "ch_tra", "hr", "cs",
-    "da", "dar", "nl", "en", "et", "fr", "de", "gom", "hi", "hu",
-    "is", "id", "inh", "ga", "it", "ja", "kbd", "kn", "ko", "ku",
-    "lbe", "la", "lv", "lez", "lt", "mah", "mai", "ms", "mt", "mi",
-    "mr", "mn", "sck", "ne", "new", "no", "oc", "pi", "fa", "pl",
-    "pt", "ro", "ru", "rs_cyrillic", "rs_latin", "sk", "sl", "es", "sw",
-    "sv", "tab", "tl", "tjk", "ta", "te", "th", "tr", "uk", "ur",
-    "ug", "uz", "vi", "cy"
-  ]
-  globals()["locales"] = st.sidebar.multiselect(
-    "**Locales**\n\nSee [list of supported OCR languages](https://www.jaided.ai/easyocr/).",
-    options=available_locales,
-    default=["en", "ru"],
-    help="Locales are two letter codes (i.e. en, fr, de)."
-  )
-
-  if st.sidebar.button("Run") and uploaded_file is not None:
-    uploaded_file.seek(0)
-    original_img = Image.open(uploaded_file)
-    savePng(original_img, "output/1.png")
-    uploaded_file.seek(0)
-
-    reader_obj = loadReader()
-
-    col1, col2, col3, col4 = st.columns(4)
-    col5, col6, col7, col8 = st.columns(4)
-    col9, col10, col11, col12 = st.columns(4)
-    
-    # Ensure output directory exists
-    if not os.path.exists("output"):
-      os.makedirs("output")
-
-    with col1:
-      st.subheader("1. Original Map")
-      st.image(uploaded_file, use_container_width=True)
-
-    with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
-      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh, text_buffer, mask_legends)
-
-    savePng(preview_img, "output/2.png")
-    with col2:
-      st.subheader("2. UI Masking")
-      st.image(preview_img, use_container_width=True)
-
-    savePng(masked_img, "output/3.png")
-    with col3:
-      st.subheader("3. Denoised Image")
-      st.image(masked_img, use_container_width=True)
-
-    savePng(edge_vis_pil, "output/4.png")
-    with col4:
-      st.subheader("4. Sharpness Layer")
-      st.image(edge_vis_pil, use_container_width=True)
-
-    savePng(composite_img, "output/5.png")
-    with col5:
-      st.subheader("5. Semantic Features")
-      st.image(composite_img, use_container_width=True)
-
-    with col6:
-      st.subheader("6. Denoised Edges")
-      final_img_np = np.array(masked_img.convert("RGB"))
-      masked_np = np.array(masked_img)
-      alpha_mask = masked_np[:, :, 3] > 0 if masked_np.shape[2] == 4 else np.ones(final_img_np.shape[:2], dtype=bool)
-
-      diversity_edges, diversity_vis_pil = buildDiversityEdgeMap(final_img_np, text_mask, river_mask, alpha_mask, text_buffer)
-      savePng(diversity_vis_pil, "output/6.png")
-      st.image(diversity_vis_pil, use_container_width=True)
-
-    with col7:
-      st.subheader("7. First-pass Segmentation")
-      with st.spinner("Merging regions bounded by diversity edges..."):
-        refined_masks = segmentAndMergeRegions(final_img_np, diversity_edges, alpha_mask, max_colour_diff=6.0)
-        segmentation_vis = renderMasks(final_img_np, refined_masks)
-        savePng(segmentation_vis, "output/7.png")
-      st.image(segmentation_vis, use_container_width=True)
-
-    with col8:
-      st.subheader("8. First-pass Filtering")
-      s1_edges = diversity_edges > 0
-
-      plot8_img = (final_img_np*0.35).astype(np.uint8)
-      s1_edges_vis = cv2.dilate(s1_edges.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-      plot8_img[s1_edges_vis] = [255, 0, 255]
-      savePng(plot8_img, "output/8.png")
-      st.image(Image.fromarray(plot8_img), use_container_width=True)
-
-    with col9:
-      st.subheader("9. Edge Restoration")
-
-      real_text_mask = np.zeros(final_img_np.shape[:2], dtype=np.uint8)
-      for bbox, text, prob in ocr_results:
-        box_pts = np.array(bbox, dtype=np.int32)
-        cv2.fillPoly(real_text_mask, [box_pts], 255)
-
-      text_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (text_buffer, text_buffer))
-      real_text_mask = cv2.dilate(real_text_mask, text_kernel) > 0
-      raw_edges = total_edges & (~real_text_mask)
-
-      if np.any(s1_edges):
-        dist_to_s1 = distance_transform_edt(~s1_edges)
-      else:
-        dist_to_s1 = np.full(s1_edges.shape, 1000.0)
-
-      strict_boundary_mask = raw_edges & (dist_to_s1 <= math.ceil(border_buffer/2))
-      boundary_colours = final_img_np[strict_boundary_mask]
-
-      if len(boundary_colours) > 0:
-        q_step = 10
-        q_colours = (boundary_colours//q_step)*q_step
-        hashes = q_colours[:, 0].astype(np.int64)*65536 + q_colours[:, 1].astype(np.int64)*256 + q_colours[:, 2].astype(np.int64)
-        unique_hashes, counts = np.unique(hashes, return_counts=True)
-
-        valid_hashes = unique_hashes[counts > 20]
-
-        q_img = (final_img_np//q_step)*q_step
-        img_hashes = q_img[:, :, 0].astype(np.int64)*65536 + q_img[:, :, 1].astype(np.int64)*256 + q_img[:, :, 2].astype(np.int64)
-        valid_colour_mask = np.isin(img_hashes, valid_hashes)
-
-        colour_filtered_edges = raw_edges & valid_colour_mask
-      else:
-        colour_filtered_edges = raw_edges
-
-      num_labels_edges, labels_edges, stats_edges, _ = cv2.connectedComponentsWithStats(colour_filtered_edges.astype(np.uint8), connectivity=8)
-      valid_external_edges = np.zeros_like(colour_filtered_edges)
-
-      for i in range(1, num_labels_edges):
-        area = stats_edges[i, cv2.CC_STAT_AREA]
-        if area >= 10:
-          component_mask = (labels_edges == i)
-          close_pixels = np.sum(component_mask & (dist_to_s1 <= border_buffer))
-
-          if close_pixels > 0 and (close_pixels/area) > 0.05:
-            valid_external_edges[component_mask] = True
-
-      close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-      valid_external_edges = cv2.morphologyEx(valid_external_edges.astype(np.uint8), cv2.MORPH_CLOSE, close_kernel) > 0
-
-      plot9_img = (final_img_np*0.35).astype(np.uint8)
-      plot9_img[valid_external_edges] = [0, 255, 255]
-      savePng(plot9_img, "output/9.png")
-      st.image(Image.fromarray(plot9_img), use_container_width=True)
-
-    with col10:
-      st.subheader("10. Second-pass Segmentation")
-      with st.spinner("Bisecting segments with validated external features..."):
-        second_pass_masks = []
-
-        bisect_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        bisect_edges = cv2.dilate(valid_external_edges.astype(np.uint8), bisect_kernel).astype(bool)
-
-        edge_density = cv2.blur(valid_external_edges.astype(np.float32), (31, 31))
-        dense_enclaves = edge_density > density_seeding_thresh/100
-
-        l1 = np.zeros(final_img_np.shape[:2], dtype=np.int32)
-        for i, mask_dict in enumerate(refined_masks):
-          l1[mask_dict["segmentation"]] = i+1
-
-        for i in range(1, len(refined_masks)+1):
-          mask_i = (l1 == i)
-          mask_i_bisected = mask_i & (~bisect_edges)
-
-          num_sub, sub_labels, sub_stats, _ = cv2.connectedComponentsWithStats(mask_i_bisected.astype(np.uint8), connectivity=4)
-
-          for j in range(1, num_sub):
-            area = sub_stats[j, cv2.CC_STAT_AREA]
-            sub_mask = (sub_labels == j)
-            is_dense = np.any(sub_mask & dense_enclaves)
-
-            min_area = 5 if is_dense else 20
-            if area >= min_area:
-              second_pass_masks.append({"segmentation": sub_mask, "area": area})
-
-        assigned_sp = np.zeros(final_img_np.shape[:2], dtype=bool)
-        for ann in second_pass_masks:
-          assigned_sp |= ann["segmentation"]
-
-        void_mask = alpha_mask & (~assigned_sp) & (~bisect_edges) & dense_enclaves
-        num_v, labels_v, stats_v, _ = cv2.connectedComponentsWithStats(void_mask.astype(np.uint8), connectivity=4)
-
-        for v in range(1, num_v):
-          v_area = stats_v[v, cv2.CC_STAT_AREA]
-          if v_area >= 5:
-            second_pass_masks.append({"segmentation": (labels_v == v), "area": v_area})
-
-        segmentation_vis_2 = renderMasks(final_img_np, second_pass_masks)
-        savePng(segmentation_vis_2, "output/10.png")
-      st.image(segmentation_vis_2, use_container_width=True)
-
-    with col11:
-      st.subheader("11. First-pass kNN Repair")
-      with st.spinner("Binning bisected gap pixels to nearest second-pass neighbour..."):
-        repaired_masks = repairSegmentation(final_img_np, refined_masks, second_pass_masks, alpha_mask, k_neighbours=5)
-        segmentation_vis_3 = renderMasks(final_img_np, repaired_masks)
-        savePng(segmentation_vis_3, "output/11.png")
-      st.image(segmentation_vis_3, use_container_width=True)
-
-    with col12:
-      st.subheader("12. Second-pass kNN Repair")
-      with st.spinner("Binning all diversity edges to nearest segment..."):
-        final_masks = repairEdgeGaps(final_img_np, repaired_masks, alpha_mask, k_neighbours=5)
-        segmentation_vis_4 = renderMasks(final_img_np, final_masks)
-        savePng(segmentation_vis_4, "output/12.png")
-      st.image(segmentation_vis_4, use_container_width=True)
-      st.success(f"Generated {len(final_masks)} fully repaired masks.")
-
 if __name__ == "__main__":
-  is_running = st.runtime.exists()
-  draw() if is_running else initApp()
+  if st.runtime.exists():
+    drawGui()
+  else:
+    cli_args = parseArgs()
+    if cli_args.gui or cli_args.input is None:
+      initApp()
+    else:
+      runCli(cli_args)
