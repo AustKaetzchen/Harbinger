@@ -56,6 +56,7 @@ def buildDiversityEdgeMap (img_rgb, text_mask=None, river_mask=None, alpha_mask=
 
   return edge_uint8, Image.fromarray(diversity_vis)
 
+
 def denoiseMap (img_pil, colour_thresh=15, edge_thresh=20):
   img_np = np.array(img_pil)
   has_alpha = img_np.shape[2] == 4
@@ -106,6 +107,7 @@ def draw ():
   uploaded_file = st.sidebar.file_uploader("Choose a map image...", type=["jpg", "jpeg", "png"])
 
   st.sidebar.subheader("Segmentation Adjustments")
+  mask_legends = st.sidebar.checkbox("Mask Map Legends / Infoboxes", value=True, help="Automatically detect and mask legend infoboxes.")
   colour_thresh = st.sidebar.slider("Colour Similarity Threshold", min_value=1, max_value=50, value=15, help="Controls colour quantisation density.")
   edge_thresh = st.sidebar.slider("Edge Gradient Threshold", min_value=1, max_value=50, value=20, help="Controls sensitivity of border detection.")
   density_seeding_thresh = st.sidebar.slider("Density Seeding Threshold", min_value=0, max_value=100, value=25, help="The higher this value, the denser edges need to be before new seeding takes place during final repair.")
@@ -123,7 +125,7 @@ def draw ():
       st.image(uploaded_file, use_container_width=True)
 
     with st.spinner("Extracting OCR, mapping geometry, and resolving enclaves..."):
-      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh, text_buffer)
+      masked_img, composite_img, preview_img, ocr_results, edge_vis_pil, text_mask, river_mask, total_edges = processMap(uploaded_file, reader_obj, colour_thresh, edge_thresh, text_buffer, mask_legends)
 
     with col2:
       st.subheader("2. UI Masking")
@@ -498,12 +500,17 @@ def postProcessMap (img_pil, reader_obj, edge_cache, edge_thresh=20, text_buffer
 
   return Image.fromarray(out_np), Image.fromarray(edge_vis), text_mask, river_mask, edge_cache
 
-def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20, text_buffer=7):
+
+def processMap (image_file, reader_obj, colour_thresh=15, edge_thresh=20, text_buffer=7, mask_legends=True):
   img_pil = Image.open(image_file).convert("RGBA")
   img_np_rgb = np.array(img_pil.convert("RGB"))
   ocr_results = reader_obj.readtext(img_np_rgb)
 
-  img_pil, preview_pil = maskInfoboxes(img_pil)
+  if mask_legends:
+    img_pil, preview_pil = maskInfoboxes(img_pil)
+  else:
+    preview_pil = img_pil.copy()
+
   denoised_pil, edge_cache = denoiseMap(img_pil, colour_thresh, edge_thresh)
   final_pil, edge_vis_pil, text_mask, river_mask, total_edges = postProcessMap(denoised_pil, reader_obj, edge_cache, edge_thresh, text_buffer)
 
