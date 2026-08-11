@@ -28,4 +28,5 @@ from scipy.stats import mode
 import streamlit as st
 from streamlit.web import cli as stcli
 ```
-Imports are not fully minimised from sam_env, so sam_env may be bigger than needed. This should be checked by Confoederatio developers in the future. No newline at end of file
+
+Imports are not fully minimised from sam_env, so sam_env may be bigger than needed. This should be checked by Confoederatio developers in the future.
