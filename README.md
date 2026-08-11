@@ -9,6 +9,8 @@
 <img src = "https://i.postimg.cc/3ND2B1zL/crd-coat-of-arms-logo.png" height = "52"> <img src = "https://i.postimg.cc/0NCrhpK4/naissance-logo.png" height = "52">
 </div><br>
 
+### Abstract.
+
 **Harbinger** is a series of CV tools/pipelines currently developed by Special Research Groups (SRGs) within CRD, capable of scraping adversarial, noisy sources, and restructuring them into clean, georeferenced vector geometries with text. Unlike other toolkits, Harbinger does not care if sources come with metadata, are highly compressed, or are very noisy.
 
 These features are intended for final use in [Naissance HGIS](https://github.com/ConfoederatioVF/Naissance). As an end-to-end pipeline, Harbinger is intended for creating geographic datasets from raster/vector sources, which future spatial AI models inside Confoederatio can train on.
