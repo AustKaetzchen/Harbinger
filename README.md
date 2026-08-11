@@ -25,7 +25,7 @@ These features are intended for final use in [Naissance HGIS](https://github.com
 Current tools included as part of **Harbinger**/Naissance HGIS:
 
 1. [Harbinger.Deprojector](https://github.com/ConfoederatioVF/Harbinger.Deprojector): Converts any arbitrary source image into an arbitrary projection, without knowing what projection the source input is in.
-2. [Harbinger.Segmentation](https://github.com/ConfoederatioVF/Harbinger.Segmentation): Segmentation model for symbolic/noisy maps, satellite imagery. Also capable of rapid segmentation for real-world images and footage.
+2. [Harbinger.Segmentation](https://github.com/ConfoederatioVF/Harbinger.Segmentation): Segmentation model for symbolic/noisy maps, satellite imagery. Also capable of rapid segmentation for real-world images and footage. Performs OCR for semantic feature matching.
 3. Harbinger.Geowarp: Part of [Naissance HGIS](https://github.com/ConfoederatioVF/Naissance). Provides 4D warping and time sync capabilities for video and image sources, as well as real-time georeferencing and manual adjustment.
 
 ### Scraping/Vercengen.
