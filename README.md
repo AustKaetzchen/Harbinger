@@ -7,7 +7,7 @@
 </div>
 <div align = "center">
 <img src = "https://i.postimg.cc/3ND2B1zL/crd-coat-of-arms-logo.png" height = "52"> <img src = "https://i.postimg.cc/0NCrhpK4/naissance-logo.png" height = "52">
-</div><br>
+</div>
 
 ### Abstract.
 
