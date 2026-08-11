@@ -8,7 +8,7 @@ Requirements:
 4. `conda env create -f environment.yml` (Installs all Python dependencies)
 5. `conda activate sam_env` (Ensures accurate dependencies once installed)
 
-The root app bundle is located in `./main/app.py`.
+The root app bundle is located in `./main/app.py`. For developers, **Spyder** configuration files are already specified.
 
 Default imports:
 ```py
