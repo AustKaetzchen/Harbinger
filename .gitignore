@@ -1,3 +1,4 @@
 archive/
 segmentation/models
+segmentation/output
 *.pth
