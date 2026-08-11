@@ -4379,11 +4379,11 @@ if __name__ == "__main__":
     import os
     
     # 1. Setup local paths (Ensure these images are in the same folder as your script, or provide absolute paths)
-    ref_path = "landarea.png"
-    src_path = "image_06.png"
+    ref_path = "to_projection.png"
+    src_path = "from_projection.png"
 
     if not os.path.exists(ref_path) or not os.path.exists(src_path):
-        raise FileNotFoundError("Please ensure 'landarea.png' and 'image_06.png' are in your working directory.")
+        raise FileNotFoundError("Please ensure 'to_projection.png' and 'from_projection.png' are in your working directory.")
 
     ref_img = cv2.imread(ref_path)
     src_img = cv2.imread(src_path)
@@ -4415,8 +4415,8 @@ if __name__ == "__main__":
         visualize_warp_grid(src_img.shape, ref_img, result.warp_coeffs)
 
     output = draw_extent(ref_img, result, thickness=4)
-    cv2.imwrite("extent_result_v5.png", output)
-    print("\nSaved extent_result_v5.png")
+    cv2.imwrite("extent.png", output)
+    print("\nSaved extent.png")
     
     # 4. Polygon-Constrained Mesh Warp Optimization
     warped_result, learned_disp, detected_bbox, final_iou = (
@@ -4440,5 +4440,5 @@ if __name__ == "__main__":
         )
     )
 
-    cv2.imwrite("warped_polygon_constrained.png", warped_result)
-    print(f"\nSaved warped_polygon_constrained.png (polygon IoU = {final_iou:.4f})")
+    cv2.imwrite("output.png", warped_result)
+    print(f"\nSaved output.png (polygon IoU = {final_iou:.4f})")
