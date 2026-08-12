@@ -30,4 +30,4 @@ Current tools included as part of **Harbinger**/Naissance HGIS:
 
 ### Scraping/Vercengen.
 
-Scraping tools and APIs are currently located within [[Vercengen]](https://confoederatio.org/Vercengen). Most tools are written in either Python/Node.js. See individual sub-repositories' READMEs for more information on any CLI contracts/GUIs provided.
+Scraping tools and APIs are currently located within [Vercengen](https://confoederatio.org/Vercengen). Most tools are written in either Python/Node.js. See individual sub-repositories' READMEs for more information on any CLI contracts/GUIs provided.
